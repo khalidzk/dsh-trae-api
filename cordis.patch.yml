@@ -6,7 +6,11 @@
 #
 # the CLI reconciles dsh.profile.bundles and appends this patch, inserting the
 # plugin row below. The plugin starts the Trae -> OpenAI/Anthropic proxy on
-# http://localhost:9220 (configurable via the `config` block).
+# http://localhost:9220 (configurable via the `config` block) and mounts the
+# settings-page JSON API under /plug-trae-api/*. The package's browser half
+# (client.js) is picked up automatically by the client-modules scanner from
+# this same entry name because package.json declares dsh.client, so no
+# separate row is needed.
 #
 # Example with custom port and API key:
 #

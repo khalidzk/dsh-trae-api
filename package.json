@@ -1,20 +1,26 @@
 {
   "name": "dsh-trae-api",
-  "version": "1.0.2",
-  "description": "DSH plugin: expose Trae Work CN credits as a local OpenAI/Anthropic compatible API for Claude Code, Cursor, Cline and other agents",
+  "version": "1.1.0",
+  "description": "DSH plugin: expose Trae Work CN credits as a local OpenAI/Anthropic compatible API for Claude Code, Cursor, Cline and other agents. Ships a DSH web settings page (status, stats, token management, hot-reload config).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
-    ".": "./lib/index.js"
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "files": [
     "lib",
     "src",
+    "client.js",
     "cordis.patch.yml",
     "setup.js",
     "start.bat",
@@ -40,19 +46,21 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Wang-JQ77/dsh-trae-api.git"
+    "url": "git+https://github.com/Casually/dsh-trae-api.git"
   },
   "bugs": {
-    "url": "https://github.com/Wang-JQ77/dsh-trae-api/issues"
+    "url": "https://github.com/Casually/dsh-trae-api/issues"
   },
-  "homepage": "https://github.com/Wang-JQ77/dsh-trae-api#readme",
+  "homepage": "https://github.com/Casually/dsh-trae-api#readme",
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek-harness",
     "trae",
     "openai",
     "anthropic",
     "proxy",
-    "llm"
+    "llm",
+    "settings-page"
   ]
 }

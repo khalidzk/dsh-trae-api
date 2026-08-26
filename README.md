@@ -6,6 +6,8 @@
 
 本项目是一个 **DeepSeek Harness (DSH) 插件**（npm 包名 `dsh-trae-api`），安装后随 `dsh` 启动自动运行代理服务；也可以独立运行。
 
+**v1.1.0 新增**：DSH Web **设置页面**（设置 → Trae API 代理）——实时状态、请求统计、Token 管理（刷新/重新解密）、上游连通性测试、配置热更新（保存即生效，无需重启 DSH）。
+
 ## 原理
 
 1. 本机已安装并登录 Trae Work CN（或 TRAE SOLO CN / Trae SG / TRAE SOLO）
@@ -34,6 +36,11 @@
 - 3 级 API 端点回退机制
 - 自适应 CN/SG 两种 SSE 事件格式
 - 上下文窗口自动截断，避免超出 Token 限制
+- **DSH 设置页面**（v1.1.0+）：
+  - 运行状态一览（监听地址、版本、上游、用户、Token/Refresh 过期倒计时）
+  - 请求统计（各端点请求数、错误数、运行时长）
+  - 一键刷新 Token / 重新解密凭证 / 测试上游连接
+  - 端口、监听地址、API Key、版本、上游地址、上下文上限在线修改，**保存后代理热重启立即生效**
 
 ## 前置条件
 
@@ -68,7 +75,7 @@ dsh web
       name: 'dsh-trae-api'
       config:
         port: 9220
-        apiKey: my-secret-key
+        apiKey: ***
 ```
 
 卸载：
@@ -132,7 +139,7 @@ claude
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:9220/v1", api_key="trae-local-api")
+client = OpenAI(base_url="http://localhost:9220/v1", api_key="***")
 
 response = client.chat.completions.create(
     model="auto",
@@ -144,6 +151,41 @@ for chunk in response:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
+
+## DSH 设置页面（v1.1.0+）
+
+以 DSH 插件方式安装后，打开 DSH Web 界面 **设置 → Trae API 代理**：
+
+| 区块 | 说明 |
+|------|------|
+| 运行状态 | 监听地址、Trae 版本、上游地址、用户 ID、Token/Refresh Token 过期时间与剩余时长 |
+| 操作 | 刷新状态 · 立即刷新 Token · 重新解密凭证（可指定版本）· 测试上游连接（发送最小探针请求，消耗极少量 token） |
+| 请求统计 | chat / messages / count_tokens / responses / models / status 各端点请求数、错误数、运行时长 |
+| 服务配置 | 端口、监听地址（127.0.0.1 / 0.0.0.0）、API Key、Trae 版本、上游地址、最大上下文 |
+| 客户端接入 | Claude Code / Cursor / Cline 接入示例（一键复制） |
+
+**配置优先级**（后者覆盖前者）：
+
+```
+内置默认值 < $DSH_HOME/plug-trae-api.json（设置页保存） < cordis.patch.yml 的 config 块
+```
+
+- 设置页保存的配置写入 `$DSH_HOME/plug-trae-api.json`，跨 DSH 重启保留；
+- 保存后内部代理服务**热重启**，新端口/密钥立即生效，无需重启 DSH；
+- 若某字段在 `cordis.patch.yml` 的 `config` 中显式声明，设置页修改会被其覆盖（页面会提示被锁定的字段）。
+
+### 设置页本地 JSON API
+
+设置页面通过以下宿主路由与插件通信（仅监听在 DSH Web 服务器上）：
+
+| 路由 | 方法 | 说明 |
+|------|------|------|
+| `/plug-trae-api/status` | GET | 运行状态 + 认证信息 + 请求统计 |
+| `/plug-trae-api/config` | GET/POST | 读取/保存配置（POST 保存后热重启代理） |
+| `/plug-trae-api/refresh-token` | POST | 手动触发 Token 刷新（ExchangeToken） |
+| `/plug-trae-api/reauth` | POST | 重新从本机 Trae IDE 解密凭证（可指定 edition） |
+| `/plug-trae-api/test` | POST | 上游连通性探针（约消耗几十~几百上游 token） |
+
 ## API 接口
 
 | 方法 | 路径 | 说明 |
@@ -193,24 +235,36 @@ for chunk in response:
 npm run setup
 ```
 
+或在 DSH 设置页面点击「重新解密凭证」。
+
+## 开发与测试
+
+```bash
+npm install
+node test/test.mjs   # 冒烟测试：挂载插件 + 遍历全部本地 API 路由
+```
+
 ## 项目结构
 
 ```
 dsh-trae-api/
 ├── lib/
-│   └── index.js           # DSH 插件入口 (ESM, export name + apply)
+│   └── index.js           # DSH 插件入口 (ESM, 代理启动 + /plug-trae-api/* JSON API)
+├── client.js              # DSH Web 设置页面 (浏览器端, ModuleLoader + React)
 ├── cordis.patch.yml       # DSH bundle patch (挂载到 loader)
 ├── start.bat              # Windows 一键启动
 ├── setup.js               # 自动解密配置
-├── package.json           # 项目配置 (含 dsh.bundle 声明)
+├── package.json           # 项目配置 (含 dsh.bundle / dsh.client 声明)
 ├── .env.example           # 环境变量模板
 ├── .gitignore
 ├── LICENSE
 ├── README.md
+├── test/
+│   └── test.mjs           # 冒烟测试
 └── src/
     ├── server.js          # 独立运行入口
-    ├── server-core.js     # 可复用服务器核心 (startServer)
-    ├── auth.js            # 认证管理 (Token 刷新)
+    ├── server-core.js     # 可复用服务器核心 (startServer + stats)
+    ├── auth.js            # 认证管理 (Token 刷新 / getAuthInfo)
     ├── trae-decrypt.js    # tc 加密解密核心
     ├── trae-client.js     # Trae API 客户端
     ├── openai-format.js   # OpenAI 格式转换

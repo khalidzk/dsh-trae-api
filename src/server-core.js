@@ -480,6 +480,7 @@ async function writeResponsesStream(chatStream, model, res) {
  *
  * @param {object} [options] - Overrides for env-based config
  * @param {number} [options.port] - Listen port (default: env PORT or 9220)
+ * @param {string} [options.host] - Listen host (default: env HOST or 127.0.0.1)
  * @param {string} [options.apiKey] - API key required by clients (default: env API_KEY)
  * @param {string} [options.edition] - Trae edition: cn/solo/sg/solo-sg (default: env TRAE_EDITION or cn)
  * @param {string} [options.manualToken] - Manual token fallback (default: env TRAE_MANUAL_TOKEN)
@@ -492,7 +493,7 @@ function startServer(options = {}) {
   app.use(express.json({ limit: '10mb' }));
 
   const PORT = parseInt(options.port || process.env.PORT || '9220', 10);
-  const HOST = process.env.HOST || '127.0.0.1';
+  const HOST = options.host || process.env.HOST || '127.0.0.1';
   const rawApiKey = options.apiKey !== undefined ? options.apiKey : (process.env.API_KEY ?? '');
   const API_KEY = rawApiKey === '' ? 'trae-local-api' : rawApiKey;
   const AUTH_ENABLED = String(API_KEY).toLowerCase() !== 'none';
@@ -501,6 +502,24 @@ function startServer(options = {}) {
 
   let BASE_URL = options.baseUrl || process.env.BASE_URL || DEFAULT_BASE_URLS[EDITION] || DEFAULT_BASE_URLS.cn;
   let effectiveEdition = EDITION;
+
+  // Lightweight request accounting, surfaced via the returned handle (and the
+  // DSH plugin's settings page). Deliberately allocation-free per request.
+  const stats = {
+    startedAt: Date.now(),
+    requests: { chat: 0, messages: 0, countTokens: 0, responses: 0, models: 0, status: 0 },
+    errors: 0,
+    lastRequestAt: null,
+    lastError: null,
+  };
+  function track(kind) {
+    stats.lastRequestAt = Date.now();
+    if (stats.requests[kind] !== undefined) stats.requests[kind] += 1;
+  }
+  function trackError(message) {
+    stats.errors += 1;
+    stats.lastError = { message: String(message).slice(0, 300), at: new Date().toISOString() };
+  }
 
   function requireAuth(req, res, next) {
     if (!AUTH_ENABLED) return next();
@@ -528,6 +547,7 @@ function startServer(options = {}) {
   });
 
   app.get('/v1/status', requireAuth, (req, res) => {
+    track('status');
     res.json({
       status: 'ok',
       edition: effectiveEdition,
@@ -539,6 +559,7 @@ function startServer(options = {}) {
   });
 
   app.get('/v1/models', requireAuth, async (req, res) => {
+    track('models');
     try {
       const models = await traeClient.getModels(BASE_URL);
       res.json({ object: 'list', data: models });
@@ -553,6 +574,7 @@ function startServer(options = {}) {
     if (!messages || !Array.isArray(messages)) {
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
     }
+    track('chat');
 
     console.log(`[server] OpenAI request: model=${model}, stream=${stream}, messages=${messages.length}`);
 
@@ -577,12 +599,14 @@ function startServer(options = {}) {
       }
     } catch (err) {
       console.error(`[server] Chat error: ${err.message}`);
+      trackError(err.message);
       const mapped = mapUpstreamStatus(err.status || 502);
       return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
     }
   });
 
   app.post('/v1/messages/count_tokens', requireAuth, (req, res) => {
+    track('countTokens');
     const { messages, system, tools } = req.body;
     if (!messages || !Array.isArray(messages)) {
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
@@ -597,6 +621,7 @@ function startServer(options = {}) {
     if (!messages || !Array.isArray(messages)) {
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
     }
+    track('messages');
 
     const bodySize = JSON.stringify(req.body).length;
     console.log(`[server] Anthropic request: model=${model}, stream=${stream}, msgs=${messages.length}, tools=${tools?.length || 0}, body=${bodySize} bytes`);
@@ -638,6 +663,7 @@ function startServer(options = {}) {
       }
     } catch (err) {
       console.error(`[server] Anthropic error: ${err.message}`);
+      trackError(err.message);
       const mapped = mapUpstreamStatus(err.status || 502);
       return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
     }
@@ -649,6 +675,7 @@ function startServer(options = {}) {
     if (input === undefined || input === null) {
       return res.status(400).json({ error: { message: 'input is required', type: 'invalid_request_error' } });
     }
+    track('responses');
 
     console.log(`[server] Responses request: model=${model}, stream=${stream}, input=${typeof input === 'string' ? 'str' : `array(${input.length})`}`);
 
@@ -679,6 +706,7 @@ function startServer(options = {}) {
       }
     } catch (err) {
       console.error(`[server] Responses error: ${err.message}`);
+      trackError(err.message);
       const mapped = mapUpstreamStatus(err.status || 502);
       return res.status(mapped.status).json({ error: { message: `Trae API error: ${err.message}`, type: mapped.type } });
     }
@@ -735,7 +763,7 @@ function startServer(options = {}) {
     }
   });
 
-  return { app, server, port: PORT, host: HOST, edition: effectiveEdition, baseUrl: BASE_URL, authOk };
+  return { app, server, port: PORT, host: HOST, edition: effectiveEdition, baseUrl: BASE_URL, authOk, stats, apiKey: API_KEY, authEnabled: AUTH_ENABLED };
 }
 
 module.exports = { startServer, DEFAULT_BASE_URLS };

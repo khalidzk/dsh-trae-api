@@ -122,6 +122,22 @@ function _saveEnv(edition) {
   }
 }
 
+/**
+ * Auth metadata snapshot for the DSH settings page. Never exposes the raw
+ * token — only presence + expiry — so the local JSON API stays safe to read.
+ */
+function getAuthInfo() {
+  if (!authData) return { hasToken: false, hasRefreshToken: false, userId: '', expiredAt: null, refreshExpiredAt: null, host: '' };
+  return {
+    hasToken: !!authData.token,
+    hasRefreshToken: !!authData.refreshToken,
+    userId: authData.userId || '',
+    expiredAt: authData.expiredAt || null,
+    refreshExpiredAt: authData.refreshExpiredAt || null,
+    host: authData.host || '',
+  };
+}
+
 function getToken() { return authData ? authData.token : null; }
 function getUserId() { return authData ? authData.userId : null; }
 function getRefreshToken() { return authData ? authData.refreshToken : null; }
@@ -174,4 +190,4 @@ async function refreshToken() {
   }
 }
 
-module.exports = { initAuth, getToken, getUserId, getRefreshToken, needsRefresh, refreshToken };
+module.exports = { initAuth, getToken, getUserId, getRefreshToken, getAuthInfo, needsRefresh, refreshToken };
