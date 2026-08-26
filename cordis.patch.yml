@@ -1,0 +1,21 @@
+# dsh-trae-api bundle patch
+#
+# Mounts the plugin into the profile's loader entries. When installed via
+#
+#   dsh plugin --profile <name> add dsh-trae-api
+#
+# the CLI reconciles dsh.profile.bundles and appends this patch, inserting the
+# plugin row below. The plugin starts the Trae -> OpenAI/Anthropic proxy on
+# http://localhost:9220 (configurable via the `config` block).
+#
+# Example with custom port and API key:
+#
+#   - insert:
+#       - id: trae-api
+#         name: 'dsh-trae-api'
+#         config:
+#           port: 9220
+#           apiKey: my-secret-key
+- insert:
+    - id: trae-api
+      name: 'dsh-trae-api'
