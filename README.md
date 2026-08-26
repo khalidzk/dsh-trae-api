@@ -4,7 +4,9 @@
 
 将 Trae Work CN 的**积分/额度**转化为本地 OpenAI/Anthropic 兼容 API 服务，让 Claude Code、Cursor、Cline、Windsurf 等第三方 AI 编程工具直接调用 Trae 底层模型（GLM、DeepSeek、Qwen、Kimi、MiniMax 等）。
 
-本项目是一个 **DeepSeek Harness (DSH) 插件**（npm 包名 `dsh-trae-api`），安装后随 `dsh` 启动自动运行代理服务；也可以独立运行。
+本项目是一个 **DeepSeek Harness (DSH) 插件**（npm 包名 `@casually/dsh-trae-api`），安装后随 `dsh` 启动自动运行代理服务；也可以独立运行。
+
+> npm 上的无 scope 包名 `dsh-trae-api` 归原项目作者所有；本 fork 以 `@casually/dsh-trae-api` 发布。
 
 **v1.1.0 新增**：DSH Web **设置页面**（设置 → Trae API 代理）——实时状态、请求统计、Token 管理（刷新/重新解密）、上游连通性测试、配置热更新（保存即生效，无需重启 DSH）。
 
@@ -60,7 +62,7 @@
 
 ```bash
 # 安装到 web profile
-dsh plugin --profile web add dsh-trae-api
+dsh plugin --profile web add @casually/dsh-trae-api
 
 # 重启 dsh 使插件生效
 dsh web
@@ -72,7 +74,7 @@ dsh web
 # 编辑 profile 的 cordis.patch.yml
 - insert:
     - id: trae-api
-      name: 'dsh-trae-api'
+      name: '@casually/dsh-trae-api'
       config:
         port: 9220
         apiKey: ***
@@ -81,7 +83,7 @@ dsh web
 卸载：
 
 ```bash
-dsh plugin --profile web remove dsh-trae-api
+dsh plugin --profile web remove @casually/dsh-trae-api
 ```
 
 ### 方式 B：独立运行
