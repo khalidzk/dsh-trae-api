@@ -1,6 +1,6 @@
 {
   "name": "@casually/dsh-trae-api",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "DSH plugin: expose Trae Work CN credits as a local OpenAI/Anthropic compatible API for Claude Code, Cursor, Cline and other agents. Ships a DSH web settings page (status, stats, token management, hot-reload config).",
   "type": "module",
   "main": "lib/index.js",
