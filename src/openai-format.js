@@ -1,8 +1,226 @@
 /**
  * openai-format.js - Convert Trae SSE events to OpenAI-compatible format
+ *
+ * Supports:
+ *   - text content chunks
+ *   - tool_calls (parsed from <tool_call>...</tool_call> or [Called tool: name] text)
+ *   - reasoning content wrapped in <think>...</think>
+ *   - finish_reason = tool_calls when tool calls detected
+ *   - token usage passthrough (from upstream token_usage event)
  */
 
 const { v4: uuidv4 } = require('uuid');
+
+const OPEN_TAG = '<tool_call>';
+const CLOSE_TAG = '</tool_call>';
+const CALLED_PREFIX = '[Called tool: ';
+const RESULT_MARKER = '\n[Tool Result]';
+const ERROR_MARKER = '\n[Tool Error]';
+const CALLED_MARKER = '\n[Called tool: ';
+
+// Extract the first complete JSON object/array from a string, or null.
+function extractFirstJson(text) {
+  const startIdx = text.search(/[{[]/);
+  if (startIdx === -1) return null;
+  let inStr = false;
+  let escape = false;
+  let depth = 0;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{' || ch === '[') depth++;
+    else if (ch === '}' || ch === ']') {
+      depth--;
+      if (depth === 0) return text.substring(startIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+function parseToolCalls(text) {
+  const parser = new StreamingToolCallParser();
+  parser.push(text);
+  const blocks = parser.takeBlocks();
+  return blocks.concat(parser.flush());
+}
+
+// Stream-friendly parser that recognises BOTH upstream tool-call text formats:
+//   <tool_call>{"name":"...","arguments":{...}}</tool_call>
+//   [Called tool: name]
+//   {json args}
+// The second form is what the model mimics from history messages, so we must
+// recognise it too, otherwise tool calls pass through as plain text.
+class StreamingToolCallParser {
+  constructor() {
+    this.buffer = '';
+    this.state = 'text'; // 'text' | 'tag' | 'called-name' | 'called-args'
+    this.currentName = null;
+  }
+
+  push(chunk) {
+    this.buffer += chunk;
+  }
+
+  takeBlocks() {
+    const blocks = [];
+    let guard = 0;
+    while (guard++ < 10000) {
+      if (this.state === 'text') {
+        const tagIdx = this.buffer.indexOf(OPEN_TAG);
+        const calledIdx = this.buffer.indexOf(CALLED_PREFIX);
+        let startIdx = -1;
+        let marker = null;
+        if (tagIdx === -1 && calledIdx === -1) {
+          const partialIdx = this.findPartialPrefix();
+          if (partialIdx >= 0) {
+            if (partialIdx > 0) {
+              blocks.push({ type: 'text', text: this.buffer.substring(0, partialIdx) });
+            }
+            this.buffer = this.buffer.substring(partialIdx);
+            break;
+          }
+          if (this.buffer) blocks.push({ type: 'text', text: this.buffer });
+          this.buffer = '';
+          break;
+        }
+        if (tagIdx === -1) { startIdx = calledIdx; marker = 'called'; }
+        else if (calledIdx === -1) { startIdx = tagIdx; marker = 'tag'; }
+        else if (tagIdx < calledIdx) { startIdx = tagIdx; marker = 'tag'; }
+        else { startIdx = calledIdx; marker = 'called'; }
+        if (startIdx > 0) blocks.push({ type: 'text', text: this.buffer.substring(0, startIdx) });
+        if (marker === 'tag') {
+          this.buffer = this.buffer.substring(startIdx + OPEN_TAG.length);
+          this.state = 'tag';
+        } else {
+          this.buffer = this.buffer.substring(startIdx + CALLED_PREFIX.length);
+          this.state = 'called-name';
+        }
+      } else if (this.state === 'tag') {
+        const endIdx = this.buffer.indexOf(CLOSE_TAG);
+        if (endIdx === -1) break;
+        const jsonStr = this.buffer.substring(0, endIdx).trim();
+        this.buffer = this.buffer.substring(endIdx + CLOSE_TAG.length);
+        this.emitTaggedBlock(blocks, jsonStr);
+        this.state = 'text';
+      } else if (this.state === 'called-name') {
+        const closeIdx = this.buffer.indexOf(']');
+        if (closeIdx === -1) break;
+        this.currentName = this.buffer.substring(0, closeIdx).trim();
+        this.buffer = this.buffer.substring(closeIdx + 1);
+        this.state = 'called-args';
+      } else if (this.state === 'called-args') {
+        let bestIdx = -1;
+        const scan = (marker) => {
+          const idx = this.buffer.indexOf(marker);
+          if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) bestIdx = idx;
+        };
+        scan(RESULT_MARKER);
+        scan(ERROR_MARKER);
+        scan(CALLED_MARKER);
+        scan(OPEN_TAG);
+        scan(CLOSE_TAG);
+        if (bestIdx === -1) break;
+        const argsStr = this.buffer.substring(0, bestIdx).trim();
+        // 边界标记本身保留在 buffer 中，交给 text 状态继续处理（如 [Tool Result] 文本）
+        this.buffer = this.buffer.substring(bestIdx);
+        this.emitCalledTool(blocks, argsStr, false);
+        this.state = 'text';
+      }
+    }
+    return blocks;
+  }
+
+  emitTaggedBlock(blocks, jsonStr) {
+    let parsed = null;
+    try { parsed = JSON.parse(jsonStr); } catch { /* not json */ }
+    if (parsed && parsed.name) {
+      blocks.push({
+        type: 'tool_use',
+        name: parsed.name,
+        input: parsed.arguments || parsed.input || parsed.parameters || {},
+      });
+    } else {
+      blocks.push({ type: 'text', text: OPEN_TAG + jsonStr + CLOSE_TAG });
+    }
+  }
+
+  emitCalledTool(blocks, argsStr, flushMode) {
+    const trimmed = (argsStr || '').trim();
+    let jsonStr = null;
+    let rest = '';
+    if (trimmed) {
+      let parsed = null;
+      try { parsed = JSON.parse(trimmed); } catch { /* not pure json */ }
+      if (parsed !== null) {
+        jsonStr = trimmed;
+      } else {
+        const json = extractFirstJson(trimmed);
+        if (json) {
+          const startIdx = trimmed.indexOf(json);
+          jsonStr = json;
+          const before = trimmed.substring(0, startIdx).trim();
+          const after = trimmed.substring(startIdx + json.length).trim();
+          rest = [before, after].filter(Boolean).join('\n');
+        }
+      }
+    }
+    let input;
+    if (jsonStr !== null) {
+      try { input = JSON.parse(jsonStr); } catch { input = trimmed; }
+    } else {
+      input = trimmed;
+    }
+    blocks.push({ type: 'tool_use', name: this.currentName || 'unknown', input });
+    if (rest) {
+      if (flushMode) blocks.push({ type: 'text', text: rest });
+      else this.buffer = rest + this.buffer;
+    }
+  }
+
+  findPartialPrefix() {
+    const tags = [OPEN_TAG, CALLED_PREFIX];
+    let best = -1;
+    for (const tag of tags) {
+      const maxLen = Math.min(tag.length, this.buffer.length);
+      for (let len = maxLen; len >= 1; len--) {
+        const tail = this.buffer.substring(this.buffer.length - len);
+        if (tag.startsWith(tail)) {
+          const idx = this.buffer.length - len;
+          if (best === -1 || idx < best) best = idx;
+          break;
+        }
+      }
+    }
+    return best;
+  }
+
+  flush() {
+    const blocks = [];
+    if (this.state === 'tag') {
+      if (this.buffer) blocks.push({ type: 'text', text: OPEN_TAG + this.buffer });
+      this.buffer = '';
+      this.state = 'text';
+    } else if (this.state === 'called-name') {
+      if (this.buffer) blocks.push({ type: 'text', text: CALLED_PREFIX + this.buffer });
+      this.buffer = '';
+      this.state = 'text';
+    } else if (this.state === 'called-args') {
+      this.emitCalledTool(blocks, this.buffer, true);
+      this.buffer = '';
+      this.state = 'text';
+    } else if (this.buffer) {
+      blocks.push({ type: 'text', text: this.buffer });
+      this.buffer = '';
+    }
+    return blocks;
+  }
+}
 
 async function handleOpenAIResponse(fetchResponse, model, stream) {
   if (!stream) {
@@ -54,11 +272,24 @@ async function collectNonStreaming(fetchResponse, model) {
     }
   }
 
+  const blocks = parseToolCalls(fullContent);
+  const toolCalls = [];
   let content = '';
   if (reasoningContent) {
     content += `<think>\n${reasoningContent}\n</think>\n\n`;
   }
-  content += fullContent;
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      content += block.text;
+    } else if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: `call_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+        type: 'function',
+        function: { name: block.name, arguments: JSON.stringify(block.input) },
+      });
+    }
+  }
+  const hasToolUse = toolCalls.length > 0;
 
   return {
     id: `chatcmpl-${uuidv4()}`,
@@ -67,8 +298,12 @@ async function collectNonStreaming(fetchResponse, model) {
     model: model,
     choices: [{
       index: 0,
-      message: { role: 'assistant', content },
-      finish_reason: finishReason,
+      message: {
+        role: 'assistant',
+        content,
+        ...(hasToolUse ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: hasToolUse ? 'tool_calls' : finishReason,
     }],
     usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
@@ -82,6 +317,62 @@ async function* streamGenerator(fetchResponse, model) {
   let thinkEnded = false;
   let lastUsage = null;
   let currentEvent = null;
+  const toolParser = new StreamingToolCallParser();
+  let toolIndex = 0;
+  let outputtingToolCalls = false;
+  let hasToolUse = false;
+
+  const makeChunk = (delta, finishReason = null) => ({
+    id: `chatcmpl-${uuidv4()}`,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      delta,
+      finish_reason: finishReason,
+    }],
+  });
+
+  const emitContent = (text) => {
+    if (!text) return;
+    let deltaContent = text;
+    if (thinkStarted && !thinkEnded) {
+      deltaContent = '</think>\n\n' + deltaContent;
+      thinkStarted = false;
+      thinkEnded = true;
+    }
+    return `data: ${JSON.stringify(makeChunk({ content: deltaContent }))}\n\n`;
+  };
+
+  const emitToolCall = (block) => {
+    if (thinkStarted && !thinkEnded) {
+      thinkStarted = false;
+      thinkEnded = true;
+    }
+    outputtingToolCalls = true;
+    hasToolUse = true;
+    const toolId = `call_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
+    let out = `data: ${JSON.stringify(makeChunk({
+      tool_calls: [{
+        index: toolIndex,
+        id: toolId,
+        type: 'function',
+        function: { name: block.name, arguments: '' },
+      }],
+    }))}\n\n`;
+    const argsStr = JSON.stringify(block.input);
+    for (let i = 0; i < argsStr.length; i += 200) {
+      out += `data: ${JSON.stringify(makeChunk({
+        tool_calls: [{
+          index: toolIndex,
+          function: { arguments: argsStr.substring(i, i + 200) },
+        }],
+      }))}\n\n`;
+    }
+    toolIndex++;
+    return out;
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -102,25 +393,62 @@ async function* streamGenerator(fetchResponse, model) {
 
       if (trimmed.startsWith('data:') && currentEvent) {
         const data = trimmed.substring(5).trim();
-        const chunks = processSSEEvent(currentEvent, data, model, {
-          thinkStarted, thinkEnded,
-        });
+        const parsed = safeJSON(data);
 
-        for (const chunk of chunks) {
-          if (chunk._thinkState) {
-            thinkStarted = chunk._thinkState.started;
-            thinkEnded = chunk._thinkState.ended;
-            delete chunk._thinkState;
-          }
-          if (chunk._usage) {
-            lastUsage = chunk._usage;
-            delete chunk._usage;
-            continue;
-          }
-          yield `data: ${JSON.stringify(chunk)}\n\n`;
-        }
+        if (currentEvent === 'output' && parsed) {
+          const reasoning = parsed.reasoning_content || '';
+          const response = parsed.response || '';
 
-        if (currentEvent === 'done') {
+          if (reasoning && !outputtingToolCalls) {
+            if (!thinkStarted) {
+              thinkStarted = true;
+              thinkEnded = false;
+              yield `data: ${JSON.stringify(makeChunk({ content: '<think>\n' + reasoning }))}\n\n`;
+            } else if (!thinkEnded) {
+              yield `data: ${JSON.stringify(makeChunk({ content: reasoning }))}\n\n`;
+            }
+          }
+
+          if (response) {
+            toolParser.push(response);
+            const blocks = toolParser.takeBlocks();
+            for (const block of blocks) {
+              if (block.type === 'text') {
+                if (outputtingToolCalls) continue;
+                const out = emitContent(block.text);
+                if (out) yield out;
+              } else if (block.type === 'tool_use') {
+                yield emitToolCall(block);
+              }
+            }
+          }
+        } else if (currentEvent === 'request_wait_in_queue' && parsed) {
+          const pos = parsed.position || 0;
+          yield `data: ${JSON.stringify(makeChunk({ content: `[Queued: position ${pos}]\n` }))}\n\n`;
+        } else if (currentEvent === 'token_usage' && parsed && typeof parsed.prompt_tokens === 'number') {
+          lastUsage = {
+            prompt_tokens: parsed.prompt_tokens,
+            completion_tokens: parsed.completion_tokens || 0,
+            total_tokens: parsed.total_tokens || 0,
+            completion_tokens_details: {
+              reasoning_tokens: parsed.reasoning_tokens || 0,
+            },
+          };
+        } else if (currentEvent === 'done') {
+          const finalBlocks = toolParser.flush();
+          for (const block of finalBlocks) {
+            if (block.type === 'text') {
+              if (outputtingToolCalls) continue;
+              const out = emitContent(block.text);
+              if (out) yield out;
+            } else if (block.type === 'tool_use') {
+              yield emitToolCall(block);
+            }
+          }
+
+          const finish = hasToolUse ? 'tool_calls' : (parsed.finish_reason || 'stop');
+          yield `data: ${JSON.stringify(makeChunk({}, finish))}\n\n`;
+
           if (lastUsage) {
             yield `data: ${JSON.stringify({
               id: `chatcmpl-${uuidv4()}`,
@@ -140,94 +468,19 @@ async function* streamGenerator(fetchResponse, model) {
     }
   }
 
-  yield 'data: [DONE]\n\n';
-}
-
-function processSSEEvent(event, data, model, state) {
-  const chunks = [];
-  const parsed = safeJSON(data);
-
-  if (event === 'request_wait_in_queue') {
-    if (parsed) {
-      const pos = parsed.position || 0;
-      chunks.push({
-        id: `chatcmpl-${uuidv4()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          index: 0,
-          delta: { content: `[Queued: position ${pos}]\n` },
-          finish_reason: null,
-        }],
-      });
+  // 流意外结束（无 done 事件）时补全
+  const finalBlocks = toolParser.flush();
+  for (const block of finalBlocks) {
+    if (block.type === 'text') {
+      if (outputtingToolCalls) continue;
+      const out = emitContent(block.text);
+      if (out) yield out;
+    } else if (block.type === 'tool_use') {
+      yield emitToolCall(block);
     }
-  } else if (event === 'output' && parsed) {
-    const response = parsed.response || '';
-    const reasoning = parsed.reasoning_content || '';
-
-    if (!response && !reasoning) return chunks;
-
-    let deltaContent = '';
-
-    if (reasoning) {
-      if (!state.thinkStarted) {
-        deltaContent = '<think>\n' + reasoning;
-        state.thinkStarted = true;
-        state.thinkEnded = false;
-      } else {
-        deltaContent = reasoning;
-      }
-    }
-
-    if (response) {
-      if (state.thinkStarted && !state.thinkEnded) {
-        deltaContent = '</think>\n\n' + response;
-        state.thinkStarted = false;
-        state.thinkEnded = true;
-      } else {
-        deltaContent = response;
-      }
-    }
-
-    chunks.push({
-      id: `chatcmpl-${uuidv4()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: { content: deltaContent },
-        finish_reason: null,
-      }],
-      _thinkState: { started: state.thinkStarted, ended: state.thinkEnded },
-    });
-  } else if (event === 'done' && parsed) {
-    chunks.push({
-      id: `chatcmpl-${uuidv4()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: parsed.finish_reason || 'stop',
-      }],
-    });
-  } else if (event === 'token_usage' && parsed && typeof parsed.prompt_tokens === 'number') {
-    chunks.push({
-      _usage: {
-        prompt_tokens: parsed.prompt_tokens,
-        completion_tokens: parsed.completion_tokens || 0,
-        total_tokens: parsed.total_tokens || 0,
-        completion_tokens_details: {
-          reasoning_tokens: parsed.reasoning_tokens || 0,
-        },
-      },
-    });
   }
-
-  return chunks;
+  yield `data: ${JSON.stringify(makeChunk({}, hasToolUse ? 'tool_calls' : 'stop'))}\n\n`;
+  yield 'data: [DONE]\n\n';
 }
 
 function parseSSE(text) {

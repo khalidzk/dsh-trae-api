@@ -3,7 +3,7 @@
  *
  * Supports:
  *   - text content block
- *   - tool_use content block (parsed from <tool_call>...</tool_call>)
+ *   - tool_use content block (parsed from <tool_call>...</tool_call> or [Called tool: name] text)
  *   - ping event (Anthropic official streaming spec)
  *   - stop_reason = tool_use when tool calls detected
  *   - token usage estimation
@@ -13,6 +13,35 @@ const { v4: uuidv4 } = require('uuid');
 
 const OPEN_TAG = '<tool_call>';
 const CLOSE_TAG = '</tool_call>';
+const CALLED_PREFIX = '[Called tool: ';
+const RESULT_MARKER = '\n[Tool Result]';
+const ERROR_MARKER = '\n[Tool Error]';
+const CALLED_MARKER = '\n[Called tool: ';
+
+// Extract the first complete JSON object/array from a string, or null.
+function extractFirstJson(text) {
+    const startIdx = text.search(/[{[]/);
+    if (startIdx === -1) return null;
+    let inStr = false;
+    let escape = false;
+    let depth = 0;
+    for (let i = startIdx; i < text.length; i++) {
+        const ch = text[i];
+        if (inStr) {
+            if (escape) escape = false;
+            else if (ch === '\\') escape = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{' || ch === '[') depth++;
+        else if (ch === '}' || ch === ']') {
+            depth--;
+            if (depth === 0) return text.substring(startIdx, i + 1);
+        }
+    }
+    return null;
+}
 
 function estimateTokens(text) {
     if (!text) return 0;
@@ -26,45 +55,23 @@ function estimateTokens(text) {
 }
 
 function parseToolCalls(text) {
-    const result = [];
-    const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    let lastIndex = 0;
-    let match;
-
-    while ((match = regex.exec(text)) !== null) {
-        if (match.index > lastIndex) {
-            const before = text.substring(lastIndex, match.index);
-            if (before.trim()) result.push({ type: 'text', text: before });
-        }
-        try {
-            const parsed = JSON.parse(match[1]);
-            if (parsed.name) {
-                result.push({
-                    type: 'tool_use',
-                    name: parsed.name,
-                    input: parsed.arguments || parsed.input || parsed.parameters || {},
-                });
-            } else {
-                result.push({ type: 'text', text: match[0] });
-            }
-        } catch (e) {
-            result.push({ type: 'text', text: match[0] });
-        }
-        lastIndex = regex.lastIndex;
-    }
-
-    if (lastIndex < text.length) {
-        const after = text.substring(lastIndex);
-        if (after.trim()) result.push({ type: 'text', text: after });
-    }
-
-    return result;
+    const parser = new StreamingToolCallParser();
+    parser.push(text);
+    const blocks = parser.takeBlocks();
+    return blocks.concat(parser.flush());
 }
 
+// Stream-friendly parser that recognises BOTH upstream tool-call text formats:
+//   <tool_call>{"name":"...","arguments":{...}}</tool_call>
+//   [Called tool: name]
+//   {json args}
+// The second form is what the model mimics from history messages, so we must
+// recognise it too, otherwise tool calls pass through as plain text.
 class StreamingToolCallParser {
     constructor() {
         this.buffer = '';
-        this.inToolCall = false;
+        this.state = 'text'; // 'text' | 'tag' | 'called-name' | 'called-args'
+        this.currentName = null;
     }
 
     push(chunk) {
@@ -73,64 +80,151 @@ class StreamingToolCallParser {
 
     takeBlocks() {
         const blocks = [];
-
-        while (true) {
-            if (this.inToolCall) {
+        let guard = 0;
+        while (guard++ < 10000) {
+            if (this.state === 'text') {
+                const tagIdx = this.buffer.indexOf(OPEN_TAG);
+                const calledIdx = this.buffer.indexOf(CALLED_PREFIX);
+                let startIdx = -1;
+                let marker = null;
+                if (tagIdx === -1 && calledIdx === -1) {
+                    const partialIdx = this.findPartialPrefix();
+                    if (partialIdx >= 0) {
+                        if (partialIdx > 0) {
+                            blocks.push({ type: 'text', text: this.buffer.substring(0, partialIdx) });
+                        }
+                        this.buffer = this.buffer.substring(partialIdx);
+                        break;
+                    }
+                    if (this.buffer) blocks.push({ type: 'text', text: this.buffer });
+                    this.buffer = '';
+                    break;
+                }
+                if (tagIdx === -1) { startIdx = calledIdx; marker = 'called'; }
+                else if (calledIdx === -1) { startIdx = tagIdx; marker = 'tag'; }
+                else if (tagIdx < calledIdx) { startIdx = tagIdx; marker = 'tag'; }
+                else { startIdx = calledIdx; marker = 'called'; }
+                if (startIdx > 0) blocks.push({ type: 'text', text: this.buffer.substring(0, startIdx) });
+                if (marker === 'tag') {
+                    this.buffer = this.buffer.substring(startIdx + OPEN_TAG.length);
+                    this.state = 'tag';
+                } else {
+                    this.buffer = this.buffer.substring(startIdx + CALLED_PREFIX.length);
+                    this.state = 'called-name';
+                }
+            } else if (this.state === 'tag') {
                 const endIdx = this.buffer.indexOf(CLOSE_TAG);
                 if (endIdx === -1) break;
                 const jsonStr = this.buffer.substring(0, endIdx).trim();
                 this.buffer = this.buffer.substring(endIdx + CLOSE_TAG.length);
-                try {
-                    const parsed = JSON.parse(jsonStr);
-                    if (parsed.name) {
-                        blocks.push({
-                            type: 'tool_use',
-                            name: parsed.name,
-                            input: parsed.arguments || parsed.input || parsed.parameters || {},
-                        });
-                    } else {
-                        blocks.push({ type: 'text', text: OPEN_TAG + jsonStr + CLOSE_TAG });
-                    }
-                } catch (e) {
-                    blocks.push({ type: 'text', text: OPEN_TAG + jsonStr + CLOSE_TAG });
-                }
-                this.inToolCall = false;
-            } else {
-                const startIdx = this.buffer.indexOf(OPEN_TAG);
-                if (startIdx === -1) {
-                    const lastLt = this.buffer.lastIndexOf('<');
-                    if (lastLt !== -1) {
-                        const tail = this.buffer.substring(lastLt);
-                        if (OPEN_TAG.startsWith(tail)) {
-                            if (lastLt > 0) {
-                                blocks.push({ type: 'text', text: this.buffer.substring(0, lastLt) });
-                            }
-                            this.buffer = tail;
-                            break;
-                        }
-                    }
-                    if (this.buffer) {
-                        blocks.push({ type: 'text', text: this.buffer });
-                    }
-                    this.buffer = '';
-                    break;
-                }
-                if (startIdx > 0) {
-                    blocks.push({ type: 'text', text: this.buffer.substring(0, startIdx) });
-                }
-                this.buffer = this.buffer.substring(startIdx + OPEN_TAG.length);
-                this.inToolCall = true;
+                this.emitTaggedBlock(blocks, jsonStr);
+                this.state = 'text';
+            } else if (this.state === 'called-name') {
+                const closeIdx = this.buffer.indexOf(']');
+                if (closeIdx === -1) break;
+                this.currentName = this.buffer.substring(0, closeIdx).trim();
+                this.buffer = this.buffer.substring(closeIdx + 1);
+                this.state = 'called-args';
+            } else if (this.state === 'called-args') {
+                let bestIdx = -1;
+                const scan = (marker) => {
+                    const idx = this.buffer.indexOf(marker);
+                    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) bestIdx = idx;
+                };
+                scan(RESULT_MARKER);
+                scan(ERROR_MARKER);
+                scan(CALLED_MARKER);
+                scan(OPEN_TAG);
+                scan(CLOSE_TAG);
+                if (bestIdx === -1) break;
+                const argsStr = this.buffer.substring(0, bestIdx).trim();
+                // 边界标记本身保留在 buffer 中，交给 text 状态继续处理（如 [Tool Result] 文本）
+                this.buffer = this.buffer.substring(bestIdx);
+                this.emitCalledTool(blocks, argsStr, false);
+                this.state = 'text';
             }
         }
         return blocks;
     }
 
+    emitTaggedBlock(blocks, jsonStr) {
+        let parsed = null;
+        try { parsed = JSON.parse(jsonStr); } catch { /* not json */ }
+        if (parsed && parsed.name) {
+            blocks.push({
+                type: 'tool_use',
+                name: parsed.name,
+                input: parsed.arguments || parsed.input || parsed.parameters || {},
+            });
+        } else {
+            blocks.push({ type: 'text', text: OPEN_TAG + jsonStr + CLOSE_TAG });
+        }
+    }
+
+    emitCalledTool(blocks, argsStr, flushMode) {
+        const trimmed = (argsStr || '').trim();
+        let jsonStr = null;
+        let rest = '';
+        if (trimmed) {
+            let parsed = null;
+            try { parsed = JSON.parse(trimmed); } catch { /* not pure json */ }
+            if (parsed !== null) {
+                jsonStr = trimmed;
+            } else {
+                const json = extractFirstJson(trimmed);
+                if (json) {
+                    const startIdx = trimmed.indexOf(json);
+                    jsonStr = json;
+                    const before = trimmed.substring(0, startIdx).trim();
+                    const after = trimmed.substring(startIdx + json.length).trim();
+                    rest = [before, after].filter(Boolean).join('\n');
+                }
+            }
+        }
+        let input;
+        if (jsonStr !== null) {
+            try { input = JSON.parse(jsonStr); } catch { input = trimmed; }
+        } else {
+            input = trimmed;
+        }
+        blocks.push({ type: 'tool_use', name: this.currentName || 'unknown', input });
+        if (rest) {
+            if (flushMode) blocks.push({ type: 'text', text: rest });
+            else this.buffer = rest + this.buffer;
+        }
+    }
+
+    findPartialPrefix() {
+        const tags = [OPEN_TAG, CALLED_PREFIX];
+        let best = -1;
+        for (const tag of tags) {
+            const maxLen = Math.min(tag.length, this.buffer.length);
+            for (let len = maxLen; len >= 1; len--) {
+                const tail = this.buffer.substring(this.buffer.length - len);
+                if (tag.startsWith(tail)) {
+                    const idx = this.buffer.length - len;
+                    if (best === -1 || idx < best) best = idx;
+                    break;
+                }
+            }
+        }
+        return best;
+    }
+
     flush() {
         const blocks = [];
-        if (this.inToolCall) {
-            blocks.push({ type: 'text', text: OPEN_TAG + this.buffer });
+        if (this.state === 'tag') {
+            if (this.buffer) blocks.push({ type: 'text', text: OPEN_TAG + this.buffer });
             this.buffer = '';
-            this.inToolCall = false;
+            this.state = 'text';
+        } else if (this.state === 'called-name') {
+            if (this.buffer) blocks.push({ type: 'text', text: CALLED_PREFIX + this.buffer });
+            this.buffer = '';
+            this.state = 'text';
+        } else if (this.state === 'called-args') {
+            this.emitCalledTool(blocks, this.buffer, true);
+            this.buffer = '';
+            this.state = 'text';
         } else if (this.buffer) {
             blocks.push({ type: 'text', text: this.buffer });
             this.buffer = '';

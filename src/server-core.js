@@ -63,6 +63,15 @@ function extractToolResultText(block) {
   return '(empty)';
 }
 
+// Render a tool call as the <tool_call> tag format that the upstream model is
+// instructed to output. Using the tag (instead of "[Called tool: name]" text)
+// keeps history consistent with the system prompt so the model mimics the
+// correct format, which our response parsers can then convert to tool_calls.
+function toolCallToTag(name, input) {
+  const argsObj = (typeof input === 'object' && input !== null) ? input : { value: input };
+  return `<tool_call>\n${JSON.stringify({ name, arguments: argsObj })}\n</tool_call>`;
+}
+
 const CLEAN_PATTERNS = [
   /<system-reminder>[\s\S]*?<\/system-reminder>/g,
   /<system-reminder>[\s\S]*?(?=<\/[a-z]|$)/g,
@@ -168,10 +177,7 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
         const nextText = extractTextFromBlocks(nextBlocks);
 
         if (toolResults.length > 0) {
-          const toolLines = toolUses.map(tu => {
-            const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-            return `[Called tool: ${tu.name}]\n${inputStr}`;
-          });
+          const toolLines = toolUses.map(tu => toolCallToTag(tu.name, tu.input));
           const resultLines = toolResults.map(tr => {
             const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
             return `${prefix}\n${extractToolResultText(tr)}`;
@@ -190,10 +196,7 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
         }
       }
 
-      const toolLines = toolUses.map(tu => {
-        const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-        return `[Called tool: ${tu.name}]\n${inputStr}`;
-      });
+      const toolLines = toolUses.map(tu => toolCallToTag(tu.name, tu.input));
       if (combinedText.trim()) combinedText += '\n\n';
       combinedText += toolLines.join('\n\n');
       if (combinedText.trim()) result.push({ role: 'assistant', content: combinedText });
@@ -253,13 +256,62 @@ function convertOpenAIMessages(messages, tools) {
     result.push({ role: 'system', content: systemParts.join('\n\n') });
   }
 
-  for (const m of messages) {
-    if (m.role === 'system') continue;
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i];
+    if (m.role === 'system') { i++; continue; }
+
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const text = typeof m.content === 'string' ? m.content :
+        Array.isArray(m.content) ? m.content.map(c => c.text || c.content || '').join('\n') : '';
+      const toolLines = m.tool_calls.map((tc) => {
+        const fn = tc.function || {};
+        let args;
+        if (typeof fn.arguments === 'string') {
+          try { args = JSON.parse(fn.arguments); } catch { args = { value: fn.arguments }; }
+        } else {
+          args = fn.arguments || {};
+        }
+        return toolCallToTag(fn.name || 'unknown', args);
+      });
+      const parts = [text, ...toolLines].filter(Boolean);
+
+      let j = i + 1;
+      const resultLines = [];
+      while (j < messages.length && messages[j].role === 'tool') {
+        const tr = messages[j];
+        const out = typeof tr.content === 'string' ? tr.content :
+          Array.isArray(tr.content) ? tr.content.map(c => c.text || c.content || '').join('\n') : '';
+        resultLines.push(`[Tool Result]\n${out}`);
+        j++;
+      }
+      if (resultLines.length > 0) {
+        parts.push(resultLines.join('\n\n'));
+        i = j;
+      } else {
+        i++;
+      }
+
+      const cleaned = cleanContent(parts.join('\n\n'));
+      if (cleaned) result.push({ role: 'assistant', content: cleaned });
+      continue;
+    }
+
+    if (m.role === 'tool') {
+      const out = typeof m.content === 'string' ? m.content :
+        Array.isArray(m.content) ? m.content.map(c => c.text || c.content || '').join('\n') : '';
+      const cleaned = cleanContent(`[Tool Result]\n${out}`);
+      if (cleaned) result.push({ role: 'user', content: cleaned });
+      i++;
+      continue;
+    }
+
     let content = '';
     if (typeof m.content === 'string') content = m.content;
     else if (Array.isArray(m.content)) content = m.content.map(c => c.text || c.content || '').join('\n');
     const cleaned = cleanContent(content);
     if (cleaned) result.push({ role: m.role, content: cleaned });
+    i++;
   }
 
   let firstSys = -1;
@@ -341,8 +393,14 @@ function convertResponsesInput(input, instructions) {
     }
     else if (item.type === 'function_call') {
       const name = item.name || 'unknown';
-      const args = typeof item.arguments === 'object' ? JSON.stringify(item.arguments) : String(item.arguments || '');
-      messages.push({ role: 'assistant', content: `[Called tool: ${name}]\n${args}` });
+      let args;
+      if (typeof item.arguments === 'object' && item.arguments !== null) {
+        args = item.arguments;
+      } else {
+        const raw = String(item.arguments || '');
+        try { args = JSON.parse(raw); } catch { args = { value: raw }; }
+      }
+      messages.push({ role: 'assistant', content: toolCallToTag(name, args) });
     }
     else if (item.type === 'function_call_output') {
       const output = typeof item.output === 'string' ? item.output : JSON.stringify(item.output || '');
@@ -366,21 +424,47 @@ function toResponsesUsage(usage) {
 }
 
 function toResponsesFormat(chatResult, model) {
-  const text = chatResult.choices?.[0]?.message?.content || '';
-  const msgId = `msg_${uuidv4()}`;
+  const message = chatResult.choices?.[0]?.message || {};
+  const text = message.content || '';
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+
+  const output = [];
+  if (text) {
+    output.push({
+      id: `msg_${uuidv4()}`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text }],
+    });
+  }
+  for (const tc of toolCalls) {
+    output.push({
+      id: `fc_${uuidv4()}`,
+      type: 'function_call',
+      status: 'completed',
+      name: tc.function?.name || '',
+      arguments: tc.function?.arguments || '',
+      call_id: tc.id || `call_${uuidv4()}`,
+    });
+  }
+  if (output.length === 0) {
+    output.push({
+      id: `msg_${uuidv4()}`,
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: '' }],
+    });
+  }
+
   return {
     id: `resp_${uuidv4()}`,
     object: 'response',
     created_at: Math.floor(Date.now() / 1000),
     status: 'completed',
     model: chatResult.model || model,
-    output: [{
-      id: msgId,
-      type: 'message',
-      status: 'completed',
-      role: 'assistant',
-      content: [{ type: 'output_text', text }],
-    }],
+    output,
     usage: toResponsesUsage(chatResult.usage),
   };
 }
@@ -419,6 +503,29 @@ async function writeResponsesStream(chatStream, model, res) {
 
   let accumulated = '';
   let usage = null;
+  const toolCalls = new Map(); // index -> { id, name, arguments, itemId, outputIndex }
+
+  const ensureToolItem = (tc, index) => {
+    if (!toolCalls.has(index)) {
+      const call = {
+        id: tc.id || `call_${uuidv4()}`,
+        name: tc.function?.name || '',
+        arguments: '',
+        itemId: `fc_${uuidv4()}`,
+        outputIndex: 1 + index,
+      };
+      toolCalls.set(index, call);
+      send('response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: call.outputIndex,
+        item: {
+          id: call.itemId, type: 'function_call', status: 'in_progress',
+          name: call.name, arguments: '', call_id: call.id,
+        },
+      });
+    }
+    return toolCalls.get(index);
+  };
 
   for await (const chunkLine of chatStream) {
     const line = chunkLine.trim();
@@ -442,8 +549,26 @@ async function writeResponsesStream(chatStream, model, res) {
         delta: delta.content,
       });
     }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const index = tc.index || 0;
+        const call = ensureToolItem(tc, index);
+        if (tc.function?.name && !call.name) {
+          call.name = tc.function.name;
+        }
+        if (tc.function?.arguments) {
+          call.arguments += tc.function.arguments;
+          send('response.function_call_arguments.delta', {
+            type: 'response.function_call_arguments.delta',
+            item_id: call.itemId, output_index: call.outputIndex,
+            delta: tc.function.arguments,
+          });
+        }
+      }
+    }
   }
 
+  // 文本消息收尾
   send('response.output_text.done', {
     type: 'response.output_text.done',
     item_id: itemId, output_index: 0, content_index: 0,
@@ -463,12 +588,46 @@ async function writeResponsesStream(chatStream, model, res) {
     },
   });
 
-  const finalResponse = {
-    ...baseResponse('completed'),
-    output: [{
+  // 工具调用收尾
+  for (const [, call] of toolCalls) {
+    send('response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      item_id: call.itemId, output_index: call.outputIndex,
+      arguments: call.arguments,
+    });
+    send('response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: call.outputIndex,
+      item: {
+        id: call.itemId, type: 'function_call', status: 'completed',
+        name: call.name, arguments: call.arguments, call_id: call.id,
+      },
+    });
+  }
+
+  const finalOutput = [];
+  if (accumulated) {
+    finalOutput.push({
       id: itemId, type: 'message', status: 'completed', role: 'assistant',
       content: [{ type: 'output_text', text: accumulated }],
-    }],
+    });
+  }
+  for (const [, call] of toolCalls) {
+    finalOutput.push({
+      id: call.itemId, type: 'function_call', status: 'completed',
+      name: call.name, arguments: call.arguments, call_id: call.id,
+    });
+  }
+  if (finalOutput.length === 0) {
+    finalOutput.push({
+      id: itemId, type: 'message', status: 'completed', role: 'assistant',
+      content: [{ type: 'output_text', text: '' }],
+    });
+  }
+
+  const finalResponse = {
+    ...baseResponse('completed'),
+    output: finalOutput,
     usage: toResponsesUsage(usage),
   };
   send('response.completed', { type: 'response.completed', response: finalResponse });
