@@ -43,6 +43,162 @@ function extractFirstJson(text) {
     return null;
 }
 
+// Lenient JSON parse. Models frequently emit real (unescaped) newlines / tabs
+// / carriage returns inside JSON string values — e.g. multi-line markdown
+// passed to a `write` tool — which strict JSON.parse rejects and makes the
+// whole <tool_call> fall through as plain text. Escape such characters inside
+// string literals, then try parsing again.
+function repairJson(text) {
+    let out = '';
+    let inStr = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (inStr) {
+            if (escape) {
+                if (ch === '\n') out += '\\n';
+                else if (ch === '\r') out += '\\r';
+                else if (ch === '\t') out += '\\t';
+                else out += ch;
+                escape = false;
+            } else if (ch === '\\') {
+                out += ch;
+                escape = true;
+            } else if (ch === '"') {
+                inStr = false;
+                out += ch;
+            } else if (ch === '\n') {
+                out += '\\n';
+            } else if (ch === '\r') {
+                out += '\\r';
+            } else if (ch === '\t') {
+                out += '\\t';
+            } else {
+                out += ch;
+            }
+        } else {
+            if (ch === '"') {
+                inStr = true;
+                out += ch;
+            } else {
+                out += ch;
+            }
+        }
+    }
+    try { return JSON.parse(out); } catch { return null; }
+}
+
+// Find the position of a <think> or <thinking> opening tag (with optional
+// trailing whitespace) starting from `from`.
+function findThinkOpen(text, from) {
+    let idx = text.indexOf('<think', from);
+    while (idx !== -1) {
+        const gt = text.indexOf('>', idx);
+        const tagBody = gt === -1 ? text.substring(idx) : text.substring(idx, gt + 1);
+        if (/^<think(ing)?\s*>$/.test(tagBody)) return idx;
+        idx = text.indexOf('<think', idx + 5);
+    }
+    return -1;
+}
+
+function skipThinkOpen(text, idx) {
+    const gt = text.indexOf('>', idx);
+    return gt === -1 ? text.length : gt + 1;
+}
+
+const THINK_OPEN = '<think';
+const THINK_CLOSE = '</think';
+
+// If the tail of `text` is a prefix of a <think / </think tag, return how many
+// characters should be held back so a tag split across chunks is not emitted
+// as plain text.
+function holdTagPrefix(text, tag) {
+    const max = Math.min(tag.length - 1, text.length);
+    for (let k = max; k >= 1; k--) {
+        if (tag.startsWith(text.substring(text.length - k))) return k;
+    }
+    return 0;
+}
+
+// Streaming state machine that separates <think>...</think> blocks (or
+// <thinking>...</thinking>) from regular assistant text. Models such as DSH
+// emit their chain-of-thought inside such tags directly in the response text;
+// clients choke on the raw tags, so we pull the reasoning out and expose it
+// separately instead.
+class ThinkExtractor {
+    constructor() {
+        this.state = 'text'; // 'text' | 'think'
+        this.thinkBuf = '';
+        this.pendingOpen = '';
+        this.pendingClose = '';
+    }
+
+    push(text) {
+        if (this.pendingOpen) {
+            text = this.pendingOpen + text;
+            this.pendingOpen = '';
+        }
+        if (this.pendingClose) {
+            text = this.pendingClose + text;
+            this.pendingClose = '';
+        }
+        let content = '';
+        let reasoning = '';
+        let i = 0;
+        while (i < text.length) {
+            if (this.state === 'text') {
+                const start = findThinkOpen(text, i);
+                if (start === -1) {
+                    const rest = text.substring(i);
+                    const held = holdTagPrefix(rest, THINK_OPEN);
+                    if (held) {
+                        content += rest.substring(0, rest.length - held);
+                        this.pendingOpen = rest.substring(rest.length - held);
+                    } else {
+                        content += rest;
+                    }
+                    break;
+                }
+                content += text.substring(i, start);
+                i = skipThinkOpen(text, start);
+                this.state = 'think';
+            } else {
+                const end = text.indexOf('</think', i);
+                if (end === -1) {
+                    const rest = text.substring(i);
+                    const held = holdTagPrefix(rest, THINK_CLOSE);
+                    if (held) {
+                        this.thinkBuf += rest.substring(0, rest.length - held);
+                        this.pendingClose = rest.substring(rest.length - held);
+                    } else {
+                        this.thinkBuf += rest;
+                    }
+                    break;
+                }
+                this.thinkBuf += text.substring(i, end);
+                const gt = text.indexOf('>', end);
+                reasoning += this.thinkBuf;
+                this.thinkBuf = '';
+                i = gt === -1 ? text.length : gt + 1;
+                this.state = 'text';
+            }
+        }
+        return { content, reasoning };
+    }
+
+    // Returns { text, think }: `text` is any deferred plain text (an unconfirmed
+    // tag prefix), `think` is the unclosed reasoning buffer (dropped by callers).
+    flush() {
+        const text = this.pendingOpen || '';
+        const think = this.thinkBuf + (this.pendingClose || '');
+        this.pendingOpen = '';
+        this.pendingClose = '';
+        this.thinkBuf = '';
+        this.state = 'text';
+        return { text, think };
+    }
+}
+
 function estimateTokens(text) {
     if (!text) return 0;
     let tokens = 0;
@@ -150,6 +306,7 @@ class StreamingToolCallParser {
     emitTaggedBlock(blocks, jsonStr) {
         let parsed = null;
         try { parsed = JSON.parse(jsonStr); } catch { /* not json */ }
+        if (!parsed) parsed = repairJson(jsonStr);
         if (parsed && parsed.name) {
             blocks.push({
                 type: 'tool_use',
@@ -168,6 +325,7 @@ class StreamingToolCallParser {
         if (trimmed) {
             let parsed = null;
             try { parsed = JSON.parse(trimmed); } catch { /* not pure json */ }
+            if (!parsed) parsed = repairJson(trimmed);
             if (parsed !== null) {
                 jsonStr = trimmed;
             } else {
@@ -183,7 +341,7 @@ class StreamingToolCallParser {
         }
         let input;
         if (jsonStr !== null) {
-            try { input = JSON.parse(jsonStr); } catch { input = trimmed; }
+            try { input = JSON.parse(jsonStr); } catch { input = repairJson(jsonStr) || trimmed; }
         } else {
             input = trimmed;
         }
@@ -214,7 +372,28 @@ class StreamingToolCallParser {
     flush() {
         const blocks = [];
         if (this.state === 'tag') {
-            if (this.buffer) blocks.push({ type: 'text', text: OPEN_TAG + this.buffer });
+            // 模型可能省略了 </tool_call> 结束标签：若 buffer 中已含完整闭合的 JSON，
+            // 尝试提取为工具调用，剩余散文保留为文本。
+            const json = extractFirstJson(this.buffer);
+            let parsed = null;
+            if (json) {
+                try { parsed = JSON.parse(json); } catch { /* not json */ }
+                if (!parsed) parsed = repairJson(json);
+            }
+            if (parsed && parsed.name) {
+                const startIdx = this.buffer.indexOf(json);
+                const before = this.buffer.substring(0, startIdx);
+                const after = this.buffer.substring(startIdx + json.length);
+                const rest = (before + after).trim();
+                blocks.push({
+                    type: 'tool_use',
+                    name: parsed.name,
+                    input: parsed.arguments || parsed.input || parsed.parameters || {},
+                });
+                if (rest) blocks.push({ type: 'text', text: rest });
+            } else if (this.buffer) {
+                blocks.push({ type: 'text', text: OPEN_TAG + this.buffer });
+            }
             this.buffer = '';
             this.state = 'text';
         } else if (this.state === 'called-name') {
@@ -264,6 +443,15 @@ async function collectNonStreaming(fetchResponse, model, inputTokens) {
                 }
             } catch {}
         }
+    }
+
+    // 提取 response 文本中的 <think>...</think> 块：剥离标签，思考内容作为普通文本保留
+    const thinkExtractor = new ThinkExtractor();
+    const split = thinkExtractor.push(fullContent);
+    const flushRes = thinkExtractor.flush();
+    fullContent = split.content + (flushRes.text || '');
+    if (split.reasoning) {
+        fullContent = split.reasoning.trimEnd() + '\n\n' + fullContent;
     }
 
     const blocks = parseToolCalls(fullContent);
@@ -323,6 +511,7 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
     let finishReason = 'end_turn';
     let doneReceived = false;
     let usageData = null;
+    const thinkExtractor = new ThinkExtractor();
 
     const messageStart = `event: message_start\ndata: ${JSON.stringify({
         type: 'message_start',
@@ -452,6 +641,11 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
                     }
                 } catch {}
 
+                const flushRes = thinkExtractor.flush();
+                if (flushRes.text) {
+                    const out0 = processBlocks([{ type: 'text', text: flushRes.text }]);
+                    if (out0) yield out0;
+                }
                 const finalBlocks = parser.flush();
                 const out1 = processBlocks(finalBlocks);
                 if (out1) yield out1;
@@ -479,10 +673,17 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
                     const text = parsed.response;
                     if (text) {
                         totalOutputText += text;
-                        parser.push(text);
-                        const blocks = parser.takeBlocks();
-                        const out = processBlocks(blocks);
-                        if (out) yield out;
+                        const split = thinkExtractor.push(text);
+                        if (split.reasoning) {
+                            const out2 = processBlocks([{ type: 'text', text: split.reasoning.trimEnd() + '\n\n' }]);
+                            if (out2) yield out2;
+                        }
+                        if (split.content) {
+                            parser.push(split.content);
+                            const blocks = parser.takeBlocks();
+                            const out = processBlocks(blocks);
+                            if (out) yield out;
+                        }
                     }
                 }
                 if (parsed.finish_reason) {
