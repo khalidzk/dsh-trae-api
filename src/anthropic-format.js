@@ -426,6 +426,8 @@ async function collectNonStreaming(fetchResponse, model, inputTokens) {
     let fullContent = '';
     let finishReason = 'end_turn';
     let usageData = null;
+    // 原生 tool_calls（SOLO 协议）：按 index 累积
+    const nativeToolCalls = new Map();
 
     for (const line of lines) {
         const trimmed = line.trim();
@@ -435,6 +437,17 @@ async function collectNonStreaming(fetchResponse, model, inputTokens) {
             try {
                 const parsed = JSON.parse(data);
                 if (parsed.response) fullContent += parsed.response;
+                if (Array.isArray(parsed.tool_calls)) {
+                    for (const tc of parsed.tool_calls) {
+                        const idx = typeof tc.index === 'number' ? tc.index : 0;
+                        const fn = tc.function_call || tc.function || {};
+                        if (!nativeToolCalls.has(idx)) nativeToolCalls.set(idx, { id: '', name: '', arguments: '' });
+                        const call = nativeToolCalls.get(idx);
+                        if (tc.id) call.id = tc.id;
+                        if (fn.name) call.name = fn.name;
+                        if (fn.arguments) call.arguments += fn.arguments;
+                    }
+                }
                 if (parsed.finish_reason) {
                     finishReason = parsed.finish_reason === 'stop' ? 'end_turn' : parsed.finish_reason;
                 }
@@ -443,6 +456,35 @@ async function collectNonStreaming(fetchResponse, model, inputTokens) {
                 }
             } catch {}
         }
+    }
+
+    // 原生 tool_calls 直接生成 tool_use blocks（优先于文本解析）
+    if (nativeToolCalls.size > 0) {
+        const content = [];
+        if (fullContent.trim()) content.push({ type: 'text', text: fullContent });
+        for (const [, call] of [...nativeToolCalls.entries()].sort((a, b) => a[0] - b[0])) {
+            let input = {};
+            try { input = JSON.parse(call.arguments || '{}'); } catch { input = { raw: call.arguments }; }
+            content.push({
+                type: 'tool_use',
+                id: call.id || `toolu_${uuidv4().replace(/-/g, '')}`,
+                name: call.name || 'unknown',
+                input,
+            });
+        }
+        return {
+            id: `msg_${uuidv4().replace(/-/g, '')}`,
+            type: 'message',
+            role: 'assistant',
+            model,
+            content,
+            stop_reason: 'tool_use',
+            stop_sequence: null,
+            usage: usageData ? {
+                input_tokens: usageData.prompt_tokens || inputTokens,
+                output_tokens: usageData.completion_tokens || 0,
+            } : { input_tokens: inputTokens, output_tokens: 0 },
+        };
     }
 
     // 提取 response 文本中的 <think>...</think> 块：剥离标签，思考内容作为普通文本保留
@@ -512,6 +554,8 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
     let doneReceived = false;
     let usageData = null;
     const thinkExtractor = new ThinkExtractor();
+    // 原生 tool_calls（SOLO 协议）已开启的 tool_use block：index -> true
+    const nativeCalls = new Map();
 
     const messageStart = `event: message_start\ndata: ${JSON.stringify({
         type: 'message_start',
@@ -667,8 +711,36 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
                 return;
             }
 
+            if (currentEvent === 'error') {
+                // 上游在 SSE 流内返回错误（HTTP 仍是 200），必须抛出而不是静默返回空响应
+                let msg = data.substring(0, 200);
+                let code = 'unknown';
+                try {
+                    const parsedErr = JSON.parse(data);
+                    msg = parsedErr.message || parsedErr.msg || msg;
+                    code = parsedErr.code || code;
+                } catch {}
+                throw new Error(`Trae upstream stream error (code=${code}): ${msg}`);
+            }
+
             try {
                 const parsed = JSON.parse(data);
+                // 原生 tool_calls（SOLO 协议）→ Anthropic tool_use blocks
+                if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+                    let nativeOut = '';
+                    for (const tc of parsed.tool_calls) {
+                        const fn = tc.function_call || tc.function || {};
+                        const idx = typeof tc.index === 'number' ? tc.index : 0;
+                        if (!nativeCalls.has(idx)) {
+                            nativeOut += closeCurrentBlock();
+                            nativeOut += startToolUseBlock(fn.name || 'unknown', tc.id || `toolu_${uuidv4().replace(/-/g, '').slice(0, 24)}`);
+                            nativeCalls.set(idx, true);
+                            hasToolUse = true;
+                        }
+                        if (fn.arguments) nativeOut += inputJsonDelta(fn.arguments);
+                    }
+                    if (nativeOut) yield nativeOut;
+                }
                 if (parsed.response !== undefined && parsed.response !== null) {
                     const text = parsed.response;
                     if (text) {

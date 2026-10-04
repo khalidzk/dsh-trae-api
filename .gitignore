@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 *.log
 .npm-cache/.npmrc.npm-cache/
+.idea/
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

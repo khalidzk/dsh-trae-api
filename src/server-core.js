@@ -100,6 +100,12 @@ function toolsToSystemPrompt(tools) {
   if (!tools || !Array.isArray(tools) || tools.length === 0) return '';
   const lines = ['You have access to the following tools. To use a tool, output EXACTLY this format:', '',
     '<tool_call>', '{"name": "tool_name", "arguments": {"param": "value"}}', '</tool_call>', '',
+    'Important rules:',
+    '- Tool results are provided to you in subsequent user messages marked "[Tool Result]".',
+    '- NEVER repeat, echo, or reproduce tool result content in your own output.',
+    '- After receiving tool results, continue the task based on them: either make the next tool call or give your final answer.',
+    '- Do not output the same tool call more than once.',
+    '',
     'Available tools:'];
 
   for (const tool of tools) {
@@ -177,6 +183,7 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
         const nextText = extractTextFromBlocks(nextBlocks);
 
         if (toolResults.length > 0) {
+          // 工具结果作为独立 user 消息，不拼进 assistant（防止模型回显工具结果）
           const toolLines = toolUses.map(tu => toolCallToTag(tu.name, tu.input));
           const resultLines = toolResults.map(tr => {
             const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
@@ -186,8 +193,9 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
           const parts = [];
           if (combinedText.trim()) parts.push(combinedText);
           parts.push(toolLines.join('\n\n'));
-          parts.push(resultLines.join('\n\n'));
           result.push({ role: 'assistant', content: parts.join('\n\n') });
+
+          result.push({ role: 'user', content: resultLines.join('\n\n') });
 
           const cleanedNext = cleanContent(nextText);
           if (cleanedNext) result.push({ role: 'user', content: cleanedNext });
@@ -225,15 +233,105 @@ function convertAnthropicMessages(messages, systemPrompt, tools) {
     }
   }
 
-  let firstSys = -1;
-  for (let j = 0; j < result.length; j++) {
-    if (result[j] && result[j].role === 'system') {
-      if (firstSys === -1) { firstSys = j; }
-      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
+  return normalizeMessages(result);
+}
+
+// 合并 system 消息与相邻同角色消息（工具结果改为 user 消息后可能产生连续 user）
+// 注意：tool 消息不可合并——每条必须保留独立的 tool_call_id
+function normalizeMessages(list) {
+  const out = [];
+  for (const m of list) {
+    if (!m) continue;
+    if (!m.content && !m.tool_calls && m.role !== 'tool') continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.role === m.role && m.role !== 'tool' && !m.tool_calls && !prev.tool_calls) {
+      prev.content += '\n\n' + (m.content || '');
+    } else {
+      out.push({ ...m });
     }
   }
+  return out;
+}
 
-  return result.filter(Boolean);
+// SOLO 原生协议的消息转换：保持 OpenAI 结构透传（tool_calls / tool role /
+// tool_call_id 原样保留，由 trae-client 映射为上游的 function_call 格式）。
+// tools 不再注入 system prompt，而是原生传给上游。
+function convertOpenAIMessagesNative(messages) {
+  const out = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role === 'system' || m.role === 'user' || m.role === 'assistant' || m.role === 'tool' ? m.role : 'user';
+
+    let content = '';
+    if (typeof m.content === 'string') content = m.content;
+    else if (Array.isArray(m.content)) {
+      content = m.content
+        .map(b => (b && (b.text || (typeof b.content === 'string' ? b.content : ''))) || '')
+        .join('\n');
+    }
+    const cleaned = cleanContent(content);
+
+    const msg = { role, content: cleaned };
+    if (role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      msg.tool_calls = m.tool_calls;
+      if (!cleaned) msg.content = '';
+    }
+    if (role === 'tool' && m.tool_call_id) {
+      msg.tool_call_id = m.tool_call_id;
+    }
+    // 跳过空的非工具消息（但保留有 tool_calls 的 assistant 和 tool 结果）
+    if (!cleaned && !msg.tool_calls && role !== 'tool') continue;
+    out.push(msg);
+  }
+  return out;
+}
+
+// SOLO 原生协议的 Anthropic 消息转换：tool_use → assistant.tool_calls，
+// tool_result → role=tool + tool_call_id，保持原生函数调用
+function convertAnthropicMessagesNative(messages, systemPrompt) {
+  const out = [];
+
+  if (systemPrompt) {
+    const sysText = typeof systemPrompt === 'string' ? systemPrompt :
+      Array.isArray(systemPrompt) ? extractTextFromBlocks(systemPrompt) : '';
+    const cleaned = cleanContent(sysText);
+    if (cleaned) out.push({ role: 'system', content: cleaned });
+  }
+
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const blocks = Array.isArray(m.content) ? m.content : null;
+    const text = typeof m.content === 'string' ? m.content : blocks ? extractTextFromBlocks(blocks) : '';
+    const toolUses = blocks ? blocks.filter(b => b && b.type === 'tool_use') : [];
+    const toolResults = blocks ? blocks.filter(b => b && b.type === 'tool_result') : [];
+
+    if (m.role === 'assistant') {
+      const cleaned = cleanContent(text);
+      if (cleaned || toolUses.length > 0) {
+        const msg = { role: 'assistant', content: cleaned };
+        if (toolUses.length > 0) {
+          msg.tool_calls = toolUses.map(tu => ({
+            id: tu.id || `call_${uuidv4().slice(0, 24)}`,
+            type: 'function',
+            function: { name: tu.name || 'unknown', arguments: JSON.stringify(tu.input || {}) },
+          }));
+        }
+        out.push(msg);
+      }
+    } else {
+      // user 消息：tool_result 转为 tool role；文本保留为 user
+      for (const tr of toolResults) {
+        out.push({
+          role: 'tool',
+          tool_call_id: tr.tool_use_id || '',
+          content: cleanContent(extractToolResultText(tr)) || '(empty)',
+        });
+      }
+      const cleaned = cleanContent(text);
+      if (cleaned) out.push({ role: 'user', content: cleaned });
+    }
+  }
+  return out;
 }
 
 function convertOpenAIMessages(messages, tools) {
@@ -276,24 +374,27 @@ function convertOpenAIMessages(messages, tools) {
       });
       const parts = [text, ...toolLines].filter(Boolean);
 
+      const cleaned = cleanContent(parts.join('\n\n'));
+      if (cleaned) result.push({ role: 'assistant', content: cleaned });
+
+      // 工具结果必须作为独立的 user 消息传入，不能拼进 assistant 消息——
+      // 否则模型会学会"自己的输出包含 [Tool Result]"，在续写时把工具结果
+      // 原文回显出来当作回答（实测 glm-5.3 出现 47k 字符回显并直接结束回合）
       let j = i + 1;
       const resultLines = [];
       while (j < messages.length && messages[j].role === 'tool') {
         const tr = messages[j];
         const out = typeof tr.content === 'string' ? tr.content :
           Array.isArray(tr.content) ? tr.content.map(c => c.text || c.content || '').join('\n') : '';
+
         resultLines.push(`[Tool Result]\n${out}`);
         j++;
       }
       if (resultLines.length > 0) {
-        parts.push(resultLines.join('\n\n'));
-        i = j;
-      } else {
-        i++;
+        const toolMsg = cleanContent(resultLines.join('\n\n'));
+        if (toolMsg) result.push({ role: 'user', content: toolMsg });
       }
-
-      const cleaned = cleanContent(parts.join('\n\n'));
-      if (cleaned) result.push({ role: 'assistant', content: cleaned });
+      i = j;
       continue;
     }
 
@@ -314,15 +415,7 @@ function convertOpenAIMessages(messages, tools) {
     i++;
   }
 
-  let firstSys = -1;
-  for (let j = 0; j < result.length; j++) {
-    if (result[j] && result[j].role === 'system') {
-      if (firstSys === -1) { firstSys = j; }
-      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
-    }
-  }
-
-  return result.filter(Boolean);
+  return normalizeMessages(result);
 }
 
 function estimateInputTokens(system, messages, tools) {
@@ -393,22 +486,21 @@ function convertResponsesInput(input, instructions) {
     }
     else if (item.type === 'function_call') {
       const name = item.name || 'unknown';
-      let args;
-      if (typeof item.arguments === 'object' && item.arguments !== null) {
-        args = item.arguments;
-      } else {
-        const raw = String(item.arguments || '');
-        try { args = JSON.parse(raw); } catch { args = { value: raw }; }
-      }
-      messages.push({ role: 'assistant', content: toolCallToTag(name, args) });
+      const raw = String(item.arguments || '{}');
+      // SOLO 原生协议：保持 tool_calls 结构（trae-client 映射 function_call 键）
+      messages.push({
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: item.call_id || item.id || `call_${uuidv4().slice(0, 24)}`, type: 'function', function: { name, arguments: raw } }],
+      });
     }
     else if (item.type === 'function_call_output') {
       const output = typeof item.output === 'string' ? item.output : JSON.stringify(item.output || '');
-      messages.push({ role: 'user', content: `[Tool Result]\n${cleanContent(output)}` });
+      messages.push({ role: 'tool', tool_call_id: item.call_id || '', content: cleanContent(output) });
     }
   }
 
-  return messages;
+  return normalizeMessages(messages);
 }
 
 function toResponsesUsage(usage) {
@@ -473,7 +565,9 @@ function safeJSON(str) {
   try { return JSON.parse(str); } catch { return null; }
 }
 
-async function writeResponsesStream(chatStream, model, res) {
+async function writeResponsesStream(chatStream, model, res, reqId = '-', startedAt = 0) {
+  const log = (...args) => console.log(`[responses:${reqId}]`, ...args);
+  let chunkCount = 0;
   const respId = `resp_${uuidv4()}`;
   const itemId = `msg_${uuidv4()}`;
   const created = Math.floor(Date.now() / 1000);
@@ -528,6 +622,10 @@ async function writeResponsesStream(chatStream, model, res) {
   };
 
   for await (const chunkLine of chatStream) {
+    chunkCount++;
+    if (chunkCount === 1) {
+      log(`first upstream chunk received${startedAt ? ` (+${Date.now() - startedAt}ms)` : ''}`);
+    }
     const line = chunkLine.trim();
     const m = line.match(/^data: (.+)$/);
     if (!m) continue;
@@ -569,6 +667,12 @@ async function writeResponsesStream(chatStream, model, res) {
   }
 
   // 文本消息收尾
+  log(`upstream stream ended: ${chunkCount} chunks, text=${accumulated.length} chars, tool_calls=${toolCalls.size}, usage=${usage ? `${usage.prompt_tokens ?? '?'}/${usage.completion_tokens ?? '?'} tokens` : 'none'}`);
+  if (toolCalls.size > 0) {
+    for (const [idx, call] of toolCalls) {
+      log(`  tool_call[${idx}]: ${call.name}(${call.arguments.length} chars args)`);
+    }
+  }
   send('response.output_text.done', {
     type: 'response.output_text.done',
     item_id: itemId, output_index: 0, content_index: 0,
@@ -731,34 +835,98 @@ function startServer(options = {}) {
     const { messages, model = 'auto', stream = false, tools, max_tokens } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
+      console.warn('[chat] 400 rejected: messages is missing');
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
     }
     track('chat');
 
-    console.log(`[server] OpenAI request: model=${model}, stream=${stream}, messages=${messages.length}`);
+    const reqId = uuidv4().slice(0, 8);
+    const startedAt = Date.now();
+    const bodySize = JSON.stringify(req.body).length;
+    console.log(`[chat:${reqId}] >>> request: model=${model}, stream=${stream}, max_tokens=${max_tokens}, tools=${tools?.length || 0}, messages=${messages.length}, body=${bodySize} bytes`);
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const types = Array.isArray(m.content) ? m.content.map(b => b.type).join('+') : typeof m.content;
+      console.log(`[chat:${reqId}]   in[${i}] role=${m.role}, types=${types}, tool_calls=${m.tool_calls?.length || 0}, tool_call_id=${m.tool_call_id || '-'}`);
+    }
 
-    const converted = convertOpenAIMessages(messages, tools);
-    console.log(`[server] Converted: ${messages.length} -> ${converted.length} messages`);
+    // SOLO 原生协议：消息保持 OpenAI 结构（tool_calls / tool role 原样透传），
+    // tools 原生传给上游，由 trae-client 负责字段名映射
+    const converted = convertOpenAIMessagesNative(messages);
+
+    // 客户端提前断开时打点（定位 codex 侧超时/取消）
+    let clientClosed = false;
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+        console.warn(`[chat:${reqId}] !!! client disconnected before response finished (+${Date.now() - startedAt}ms)`);
+      }
+    });
 
     try {
+      console.log(`[chat:${reqId}] sending upstream request to ${BASE_URL}...`);
+      const upstreamStart = Date.now();
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-        converted, model, stream, BASE_URL, { maxTokens: max_tokens }
+        converted, model, stream, BASE_URL, { maxTokens: max_tokens, tools }
       );
+      console.log(`[chat:${reqId}] upstream connected +${Date.now() - upstreamStart}ms (model=${usedModel}, status=${fetchResp?.status})`);
 
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         const sseStream = await handleOpenAIResponse(fetchResp, usedModel, true);
-        for await (const chunk of sseStream) { res.write(chunk); }
+        let chunkCount = 0;
+        let firstChunkAt = 0;
+        // 响应摘要统计（定位模型"只说不做"或截断问题）
+        let finishReasonSeen = null;
+        let contentChars = 0;
+        let reasoningChars = 0;
+        let toolCallCount = 0;
+        const seenToolIdx = new Set();
+        for await (const chunk of sseStream) {
+          chunkCount++;
+          if (chunkCount === 1) {
+            firstChunkAt = Date.now();
+            console.log(`[chat:${reqId}] first chunk -> client (+${firstChunkAt - startedAt}ms)`);
+          }
+          // 解析 chunk 摘要（chunk 为单个 SSE data 行）
+          const m = chunk.match(/^data: (.+)$/s);
+          if (m) {
+            const p = safeJSON(m[1]);
+            if (p && p.choices) {
+              if (p.choices[0]?.finish_reason) finishReasonSeen = p.choices[0].finish_reason;
+              const d = p.choices[0]?.delta || {};
+              if (d.content) contentChars += d.content.length;
+              if (d.reasoning_content) reasoningChars += d.reasoning_content.length;
+              if (Array.isArray(d.tool_calls)) {
+                for (const tc of d.tool_calls) {
+                  if (tc.index !== undefined && !seenToolIdx.has(tc.index)) {
+                    seenToolIdx.add(tc.index);
+                    toolCallCount++;
+                  }
+                }
+              }
+            }
+          }
+          res.write(chunk);
+        }
         res.end();
+        console.log(`[chat:${reqId}] <<< stream done +${Date.now() - startedAt}ms, ${chunkCount} chunks sent, finish=${finishReasonSeen}, content=${contentChars} chars, reasoning=${reasoningChars} chars, tool_calls=${toolCallCount}${clientClosed ? ' (client had disconnected)' : ''}`);
       } else {
         const result = await handleOpenAIResponse(fetchResp, usedModel, false);
         res.json(result);
+        console.log(`[chat:${reqId}] <<< json done +${Date.now() - startedAt}ms, content=${result?.choices?.[0]?.message?.content?.length || 0} chars`);
       }
     } catch (err) {
-      console.error(`[server] Chat error: ${err.message}`);
+      console.error(`[chat:${reqId}] !!! error +${Date.now() - startedAt}ms: ${err.message}${err.status ? ` (status=${err.status})` : ''}`);
       trackError(err.message);
+      // 流已开始输出后不能再设置状态码，只能以 SSE 错误事件收尾
+      if (res.headersSent) {
+        res.write(`data: ${JSON.stringify({ error: { message: `Trae API error: ${err.message}`, type: 'api_error' } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
       const mapped = mapUpstreamStatus(err.status || 502);
       return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
     }
@@ -791,7 +959,8 @@ function startServer(options = {}) {
       console.log(`[server]   in[${i}] role=${m.role}, types=${types}`);
     }
 
-    const converted = convertAnthropicMessages(messages, system, tools);
+    // SOLO 原生协议：tool_use / tool_result 保持原生结构，tools 原生传上游
+    const converted = convertAnthropicMessagesNative(messages, system);
 
     const totalSize = JSON.stringify(converted).length;
     console.log(`[server] Converted: ${messages.length} -> ${converted.length} messages, ${totalSize} bytes`);
@@ -806,7 +975,7 @@ function startServer(options = {}) {
 
     try {
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-        converted, model, stream, BASE_URL, { maxTokens: max_tokens }
+        converted, model, stream, BASE_URL, { maxTokens: max_tokens, tools }
       );
 
       if (stream) {
@@ -823,6 +992,11 @@ function startServer(options = {}) {
     } catch (err) {
       console.error(`[server] Anthropic error: ${err.message}`);
       trackError(err.message);
+      // 流已开始输出后不能再设置状态码，只能以 SSE 错误事件收尾
+      if (res.headersSent) {
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: `Trae API error: ${err.message}` } })}\n\n`);
+        return res.end();
+      }
       const mapped = mapUpstreamStatus(err.status || 502);
       return sendAnthropicError(res, mapped.status, mapped.type, `Trae API error: ${err.message}`);
     }
@@ -832,40 +1006,65 @@ function startServer(options = {}) {
     const { input, model = 'auto', stream = false, instructions, tools, max_output_tokens } = req.body;
 
     if (input === undefined || input === null) {
+      console.warn('[responses] 400 rejected: input is missing');
       return res.status(400).json({ error: { message: 'input is required', type: 'invalid_request_error' } });
     }
     track('responses');
 
-    console.log(`[server] Responses request: model=${model}, stream=${stream}, input=${typeof input === 'string' ? 'str' : `array(${input.length})`}`);
+    const reqId = uuidv4().slice(0, 8);
+    const startedAt = Date.now();
+    const bodySize = JSON.stringify(req.body).length;
+    console.log(`[responses:${reqId}] >>> request: model=${model}, stream=${stream}, max_output_tokens=${max_output_tokens}, tools=${tools?.length || 0}, instructions=${instructions?.length || 0} chars, input=${typeof input === 'string' ? 'str' : `array(${input.length})`}, body=${bodySize} bytes`);
+    if (Array.isArray(input)) {
+      for (let i = 0; i < input.length; i++) {
+        const item = input[i];
+        const types = Array.isArray(item.content) ? item.content.map(b => b.type).join('+') : typeof item.content;
+        console.log(`[responses:${reqId}]   in[${i}] type=${item.type}, role=${item.role || '-'}, types=${types}, call_id=${item.call_id || '-'}`);
+      }
+    }
 
     const converted = convertResponsesInput(input, instructions);
-    const toolPrompt = toolsToSystemPrompt(tools);
-    if (toolPrompt) {
-      const sysIdx = converted.findIndex(m => m.role === 'system');
-      if (sysIdx >= 0) converted[sysIdx].content += '\n\n' + toolPrompt;
-      else converted.unshift({ role: 'system', content: toolPrompt });
-    }
-    console.log(`[server] Converted: -> ${converted.length} messages`);
+    console.log(`[responses:${reqId}] converted: ${converted.length} messages (native tools=${tools?.length || 0})`);
+
+    // 客户端提前断开时打点（定位 codex 侧超时/取消）
+    let clientClosed = false;
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        clientClosed = true;
+        console.warn(`[responses:${reqId}] !!! client disconnected before response finished (+${Date.now() - startedAt}ms)`);
+      }
+    });
 
     try {
+      console.log(`[responses:${reqId}] sending upstream request to ${BASE_URL}...`);
+      const upstreamStart = Date.now();
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-        converted, model, stream, BASE_URL, { maxTokens: max_output_tokens }
+        converted, model, stream, BASE_URL, { maxTokens: max_output_tokens, tools }
       );
+      console.log(`[responses:${reqId}] upstream connected +${Date.now() - upstreamStart}ms (model=${usedModel}, status=${fetchResp?.status})`);
 
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         const chatStream = await handleOpenAIResponse(fetchResp, usedModel, true);
-        await writeResponsesStream(chatStream, usedModel, res);
+        await writeResponsesStream(chatStream, usedModel, res, reqId, startedAt);
         res.end();
+        console.log(`[responses:${reqId}] <<< stream done +${Date.now() - startedAt}ms${clientClosed ? ' (client had disconnected)' : ''}`);
       } else {
         const chatResult = await handleOpenAIResponse(fetchResp, usedModel, false);
         res.json(toResponsesFormat(chatResult, usedModel));
+        console.log(`[responses:${reqId}] <<< json done +${Date.now() - startedAt}ms, content=${chatResult?.choices?.[0]?.message?.content?.length || 0} chars`);
       }
     } catch (err) {
-      console.error(`[server] Responses error: ${err.message}`);
+      console.error(`[responses:${reqId}] !!! error +${Date.now() - startedAt}ms: ${err.message}${err.status ? ` (status=${err.status})` : ''}`);
       trackError(err.message);
+      // 流已开始输出后不能再设置状态码，只能以 SSE 错误事件收尾
+      if (res.headersSent) {
+        res.write(`event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', response: { id: 'resp_error', error: { message: `Trae API error: ${err.message}` } } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
       const mapped = mapUpstreamStatus(err.status || 502);
       return res.status(mapped.status).json({ error: { message: `Trae API error: ${err.message}`, type: mapped.type } });
     }

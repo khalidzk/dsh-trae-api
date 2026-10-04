@@ -416,6 +416,8 @@ async function collectNonStreaming(fetchResponse, model) {
   let finishReason = 'stop';
   let reasoningContent = '';
   let usage = null;
+  // 原生 tool_calls（SOLO 协议）：按 index 累积
+  const nativeToolCalls = new Map();
 
   for (const { event, data } of events) {
     if (event === 'output') {
@@ -427,10 +429,29 @@ async function collectNonStreaming(fetchResponse, model) {
         if (parsed.response) {
           fullContent += parsed.response;
         }
+        if (Array.isArray(parsed.tool_calls)) {
+          for (const tc of parsed.tool_calls) {
+            const idx = typeof tc.index === 'number' ? tc.index : 0;
+            const fn = tc.function_call || tc.function || {};
+            if (!nativeToolCalls.has(idx)) {
+              nativeToolCalls.set(idx, { id: '', name: '', arguments: '' });
+            }
+            const call = nativeToolCalls.get(idx);
+            if (tc.id) call.id = tc.id;
+            if (fn.name) call.name = fn.name;
+            if (fn.arguments) call.arguments += fn.arguments;
+          }
+        }
         if (parsed.finish_reason) {
           finishReason = parsed.finish_reason;
         }
       }
+    } else if (event === 'error') {
+      // 上游在 SSE 流内返回错误（HTTP 仍是 200），必须抛出而不是静默返回空响应
+      const parsedErr = safeJSON(data);
+      const msg = (parsedErr && (parsedErr.message || parsedErr.msg)) || data.substring(0, 200);
+      const code = (parsedErr && parsedErr.code) || 'unknown';
+      throw new Error(`Trae upstream stream error (code=${code}): ${msg}`);
     } else if (event === 'token_usage') {
       const parsed = safeJSON(data);
       if (parsed && typeof parsed.prompt_tokens === 'number') {
@@ -469,6 +490,18 @@ async function collectNonStreaming(fetchResponse, model) {
         id: `call_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
         type: 'function',
         function: { name: block.name, arguments: JSON.stringify(block.input) },
+      });
+    }
+  }
+  // 合入原生 tool_calls（优先于文本解析结果）
+  if (nativeToolCalls.size > 0) {
+    toolCalls.length = 0;
+    content = fullContent;
+    for (const [, call] of [...nativeToolCalls.entries()].sort((a, b) => a[0] - b[0])) {
+      toolCalls.push({
+        id: call.id || `call_${uuidv4().replace(/-/g, '').substring(0, 24)}`,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments || '{}' },
       });
     }
   }
@@ -577,6 +610,23 @@ async function* streamGenerator(fetchResponse, model) {
           const reasoning = parsed.reasoning_content || '';
           const response = parsed.response || '';
 
+          // 原生 tool_calls（SOLO 协议）：function_call 键，按 index 流式分段
+          if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+            outputtingToolCalls = true;
+            hasToolUse = true;
+            for (const tc of parsed.tool_calls) {
+              const fn = tc.function_call || tc.function || {};
+              const deltaTc = { index: typeof tc.index === 'number' ? tc.index : 0 };
+              if (tc.id) deltaTc.id = tc.id;
+              if (tc.type) deltaTc.type = 'function';
+              deltaTc.function = {
+                ...(fn.name ? { name: fn.name } : {}),
+                arguments: fn.arguments || '',
+              };
+              yield `data: ${JSON.stringify(makeChunk({ tool_calls: [deltaTc] }))}\n\n`;
+            }
+          }
+
           if (reasoning && !outputtingToolCalls) {
             const out = emitReasoning(reasoning);
             if (out) yield out;
@@ -602,6 +652,11 @@ async function* streamGenerator(fetchResponse, model) {
               }
             }
           }
+        } else if (currentEvent === 'error') {
+          // 上游在 SSE 流内返回错误（HTTP 仍是 200），必须抛出而不是静默返回空响应
+          const msg = (parsed && (parsed.message || parsed.msg)) || data.substring(0, 200);
+          const code = (parsed && parsed.code) || 'unknown';
+          throw new Error(`Trae upstream stream error (code=${code}): ${msg}`);
         } else if (currentEvent === 'request_wait_in_queue' && parsed) {
           const pos = parsed.position || 0;
           yield `data: ${JSON.stringify(makeChunk({ content: `[Queued: position ${pos}]\n` }))}\n\n`;
