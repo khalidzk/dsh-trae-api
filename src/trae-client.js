@@ -514,6 +514,7 @@ function renderToolsText(tools) {
     '- 系统提示中的原生 IDE 工具（Read/Glob/Grep/Task 等）在本次 API 会话中不可用，请勿使用。',
     '- 下列工具已由 API 客户端注册到本会话，是真实可用的，必须通过 <tool_use> 标签以纯文本形式输出调用。',
     '- 需要外部信息或执行操作时，直接输出 <tool_use> 标签，不要口头拒绝或声称工具不存在。',
+    '- 不要只输出计划或意图描述（如"我先看一下..."）后结束回合——只要任务未完成且需要工具，就必须在本回合直接输出 <tool_use> 标签发起调用。只有任务全部完成时才允许以纯文本结束。',
     '- 收到 [Tool Result] 后继续任务：发起下一个工具调用，或给出最终回答。',
     '- 工具调用发出后等待结果回传，不要重复发起完全相同的调用。',
     '',
@@ -613,10 +614,11 @@ function adaptAgentTaskStream(fetchResp, model) {
   const encoder = new TextEncoder();
   const upstream = fetchResp.body.getReader();
   const decoder = new TextDecoder();
-  // 调试用原始流转储（TRAE_DEBUG_RAW 设置时启用）
+  // 调试用原始流转储（TRAE_DEBUG_RAW 设置时启用，按请求独立文件）
   let debugRawFd = null;
-  if (process.env.TRAE_DEBUG_RAW) {
-    try { debugRawFd = require('fs').openSync(process.env.TRAE_DEBUG_RAW + '.raw.sse', 'w'); } catch { /* ignore */ }
+  if (global.__traeDebugDumpPath) {
+    try { debugRawFd = require('fs').openSync(global.__traeDebugDumpPath + '.raw.sse', 'w'); } catch { /* ignore */ }
+    global.__traeDebugDumpPath = null;
   }
 
   const adapted = new ReadableStream({
@@ -745,11 +747,15 @@ async function sendAgentTaskRequest(messages, model, stream, options) {
   }
 
   console.log(`[trae-client] agent-task channel: model=${traeModel} (${internalName}), transcript=${transcript.length} chars`);
-  // 调试用：TRAE_DEBUG_RAW=<路径> 时转储上游原始流与渲染的 transcript
+  // 调试用：TRAE_DEBUG_RAW=<路径前缀> 时按请求转储上游原始流与渲染的 transcript
   if (process.env.TRAE_DEBUG_RAW) {
     try {
       const fs = require('fs');
-      fs.writeFileSync(process.env.TRAE_DEBUG_RAW + '.transcript.txt', transcript);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(11, 19) + '-' + Math.random().toString(36).slice(2, 6);
+      const dumpPath = `${process.env.TRAE_DEBUG_RAW}.${stamp}`;
+      fs.writeFileSync(dumpPath + '.transcript.txt', transcript);
+      // 记录 dump 文件名，供 adaptAgentTaskStream 使用
+      global.__traeDebugDumpPath = dumpPath;
     } catch { /* ignore */ }
   }
   return {

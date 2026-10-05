@@ -1097,7 +1097,8 @@ function startServer(options = {}) {
     });
 
     try {
-      console.log(`[responses:${reqId}] sending upstream request to ${BASE_URL}...`);
+      const reqChannel = (process.env.TRAE_CHANNEL || 'agent').toLowerCase();
+      console.log(`[responses:${reqId}] sending upstream request to ${reqChannel === 'agent' ? 'https://console.enterprise.trae.cn (agent-task)' : BASE_URL}...`);
       const upstreamStart = Date.now();
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
         converted, model, stream, BASE_URL, { maxTokens: max_output_tokens, tools }
