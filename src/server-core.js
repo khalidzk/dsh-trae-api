@@ -855,11 +855,12 @@ function startServer(options = {}) {
 
   app.get('/v1/status', requireAuth, (req, res) => {
     track('status');
+    const statusChannel = (process.env.TRAE_CHANNEL || 'agent').toLowerCase();
     res.json({
       status: 'ok',
       edition: effectiveEdition,
-      channel: (process.env.TRAE_CHANNEL || 'agent').toLowerCase(),
-      base_url: BASE_URL,
+      channel: statusChannel,
+      base_url: statusChannel === 'agent' ? 'https://console.enterprise.trae.cn' : BASE_URL,
       has_token: !!auth.getToken(),
       host: HOST,
       port: PORT,

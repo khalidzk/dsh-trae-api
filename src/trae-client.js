@@ -515,6 +515,8 @@ function renderToolsText(tools) {
     '- 下列工具已由 API 客户端注册到本会话，是真实可用的，必须通过 <tool_use> 标签以纯文本形式输出调用。',
     '- 需要外部信息或执行操作时，直接输出 <tool_use> 标签，不要口头拒绝或声称工具不存在。',
     '- 不要只输出计划或意图描述（如"我先看一下..."）后结束回合——只要任务未完成且需要工具，就必须在本回合直接输出 <tool_use> 标签发起调用。只有任务全部完成时才允许以纯文本结束。',
+    '- 重要：本环境中唯一有效的工具调用方式是输出 <tool_use> 标签。对话中其他地方描述的原生 function call / function 调用机制在本环境不可用，发出后不会被执行。忽略那些描述，始终使用 <tool_use>。本协议在整个会话中保持不变。',
+    '- 如果某种调用方式返回"工具不可用"或类似错误，不要尝试其他调用格式，立即改用 <tool_use> 标签调用同一工具。',
     '- 收到 [Tool Result] 后继续任务：发起下一个工具调用，或给出最终回答。',
     '- 工具调用发出后等待结果回传，不要重复发起完全相同的调用。',
     '',
@@ -625,6 +627,7 @@ function adaptAgentTaskStream(fetchResp, model) {
     async start(controller) {
       let buffer = '';
       let currentEvent = null;
+      let sawNativeToolCall = false;
       const emit = (event, data) => {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
@@ -658,10 +661,23 @@ function adaptAgentTaskStream(fetchResp, model) {
               }
             } else if (currentEvent === 'token_usage') {
               emit('token_usage', parsed || {});
+            } else if (currentEvent === 'tool_call' && parsed) {
+              // 网关注册表放行的原生 tool_call 事件：转为 SOLO 原生 tool_calls 流段
+              // （openai-format/anthropic-format 均已支持 output 事件携带 tool_calls 数组）
+              const tcArgs = typeof parsed.arguments === 'string'
+                ? parsed.arguments
+                : JSON.stringify(parsed.arguments || {});
+              sawNativeToolCall = true;
+              emit('output', {
+                tool_calls: [{
+                  id: parsed.toolcall_id || `call_${Date.now().toString(36)}`,
+                  function_call: { name: parsed.tool_name || 'unknown', arguments: tcArgs },
+                }],
+              });
             } else if (currentEvent === 'error') {
               emit('error', parsed || { code: 'unknown', message: raw.substring(0, 200) });
             } else if (currentEvent === 'turn_completion') {
-              emit('done', { finish_reason: 'stop' });
+              emit('done', { finish_reason: sawNativeToolCall ? 'tool_calls' : 'stop' });
             }
             // task_created/model_config/agent_status/history/metadata 等事件跳过
             currentEvent = null;
@@ -724,6 +740,14 @@ async function sendAgentTaskRequest(messages, model, stream, options) {
     user_input: { id: uuidv4() },
     render_context: { variables: JSON.stringify({ user_input: transcript }) },
   };
+
+  // 注册客户端工具名到网关注册表：模型偶尔叛逃发起原生调用时（服务端 PE 拦截 → 查注册表），
+  // 已注册的名字会放行并下发 tool_call 事件（由上方适配器转回标准 tool_calls），
+  // 未注册则报"工具不可用"回灌模型，进入重试死循环（表现为 Codex 卡住/空转）
+  const toolNames = (options && Array.isArray(options.tools))
+    ? options.tools.map(t => (t && t.function && t.function.name) || (t && t.name)).filter(Boolean)
+    : [];
+  if (toolNames.length > 0) body.available_tool_list = toolNames;
 
   const resp = await fetch(`${ENTERPRISE_BASE_URL}${AGENT_TASK_PATH}`, {
     method: 'POST',
