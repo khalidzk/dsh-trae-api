@@ -855,6 +855,7 @@ function startServer(options = {}) {
     res.json({
       status: 'ok',
       edition: effectiveEdition,
+      channel: (process.env.TRAE_CHANNEL || 'agent').toLowerCase(),
       base_url: BASE_URL,
       has_token: !!auth.getToken(),
       host: HOST,
@@ -905,7 +906,8 @@ function startServer(options = {}) {
     });
 
     try {
-      console.log(`[chat:${reqId}] sending upstream request to ${BASE_URL}...`);
+      const channel = (process.env.TRAE_CHANNEL || 'agent').toLowerCase();
+      console.log(`[chat:${reqId}] sending upstream request to ${channel === 'agent' ? 'https://console.enterprise.trae.cn (agent-task)' : BASE_URL}...`);
       const upstreamStart = Date.now();
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
         converted, model, stream, BASE_URL, { maxTokens: max_tokens, tools }
@@ -1156,7 +1158,9 @@ function startServer(options = {}) {
     }
     console.log(`[server] Running on http://${HOST}:${PORT}`);
     console.log(`[server] Edition: ${effectiveEdition.toUpperCase()}`);
-    console.log(`[server] Base URL: ${BASE_URL}`);
+    const channel = (process.env.TRAE_CHANNEL || 'agent').toLowerCase();
+    console.log(`[server] Channel: ${channel}${channel === 'agent' ? ' (enterprise billing via create_agent_task)' : ' (llm_utils_chat)'}`);
+    console.log(`[server] Base URL: ${channel === 'agent' ? 'https://console.enterprise.trae.cn' : BASE_URL}`);
     console.log(`[server] API Key: ${AUTH_ENABLED ? '***' : '(auth disabled)'}`);
     console.log(`[server] Auth: ${authOk ? 'OK' : 'FAILED'}`);
     if (!options.quiet) {

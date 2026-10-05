@@ -13,6 +13,11 @@ const { v4: uuidv4 } = require('uuid');
 
 const OPEN_TAG = '<tool_call>';
 const CLOSE_TAG = '</tool_call>';
+// agent 通道（create_agent_task）改用 <tool_use> 标签：服务端 PE 会拦截解析
+// <tool_call> 并转成原生工具调用（因客户端工具不在服务端注册表而报错循环），
+// 而 <tool_use> 不被识别，能以纯文本穿透 thought 流，由本解析器归一化处理。
+const TOOL_USE_OPEN = '<tool_use>';
+const TOOL_USE_CLOSE = '</tool_use>';
 const CALLED_PREFIX = '[Called tool: ';
 const RESULT_MARKER = '\n[Tool Result]';
 const ERROR_MARKER = '\n[Tool Error]';
@@ -224,6 +229,12 @@ class StreamingToolCallParser {
   }
 
   takeBlocks() {
+    // 归一化 <tool_use> 标签为 <tool_call>（完整标签才替换；跨 chunk 的部分
+    // 标签由 findPartialPrefix 扣留，拼完整后再进来替换）
+    if (this.buffer.includes(TOOL_USE_OPEN) || this.buffer.includes(TOOL_USE_CLOSE)) {
+      this.buffer = this.buffer.split(TOOL_USE_OPEN).join(OPEN_TAG)
+        .split(TOOL_USE_CLOSE).join(CLOSE_TAG);
+    }
     const blocks = [];
     let guard = 0;
     while (guard++ < 10000) {
@@ -342,7 +353,7 @@ class StreamingToolCallParser {
   }
 
   findPartialPrefix() {
-    const tags = [OPEN_TAG, CALLED_PREFIX];
+    const tags = [OPEN_TAG, CALLED_PREFIX, TOOL_USE_OPEN, TOOL_USE_CLOSE];
     let best = -1;
     for (const tag of tags) {
       const maxLen = Math.min(tag.length, this.buffer.length);
