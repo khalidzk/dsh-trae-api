@@ -613,6 +613,11 @@ function adaptAgentTaskStream(fetchResp, model) {
   const encoder = new TextEncoder();
   const upstream = fetchResp.body.getReader();
   const decoder = new TextDecoder();
+  // 调试用原始流转储（TRAE_DEBUG_RAW 设置时启用）
+  let debugRawFd = null;
+  if (process.env.TRAE_DEBUG_RAW) {
+    try { debugRawFd = require('fs').openSync(process.env.TRAE_DEBUG_RAW + '.raw.sse', 'w'); } catch { /* ignore */ }
+  }
 
   const adapted = new ReadableStream({
     async start(controller) {
@@ -625,7 +630,9 @@ function adaptAgentTaskStream(fetchResp, model) {
         while (true) {
           const { done, value } = await upstream.read();
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+          const text = decoder.decode(value, { stream: true });
+          if (debugRawFd !== null) { try { require('fs').writeSync(debugRawFd, text); } catch { /* ignore */ } }
+          buffer += text;
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
           for (const line of lines) {
@@ -661,6 +668,7 @@ function adaptAgentTaskStream(fetchResp, model) {
         // 流意外结束（无 turn_completion）也要发 done，让下游正常收尾
         emit('done', { finish_reason: 'stop' });
         controller.close();
+        if (debugRawFd !== null) { try { require('fs').closeSync(debugRawFd); } catch { /* ignore */ } debugRawFd = null; }
       } catch (err) {
         controller.error(err);
       }
@@ -737,6 +745,13 @@ async function sendAgentTaskRequest(messages, model, stream, options) {
   }
 
   console.log(`[trae-client] agent-task channel: model=${traeModel} (${internalName}), transcript=${transcript.length} chars`);
+  // 调试用：TRAE_DEBUG_RAW=<路径> 时转储上游原始流与渲染的 transcript
+  if (process.env.TRAE_DEBUG_RAW) {
+    try {
+      const fs = require('fs');
+      fs.writeFileSync(process.env.TRAE_DEBUG_RAW + '.transcript.txt', transcript);
+    } catch { /* ignore */ }
+  }
   return {
     response: adaptAgentTaskStream(peek.response, traeModel),
     model: traeModel,
@@ -842,6 +857,8 @@ async function getModels(baseUrl) {
 }
 
 module.exports = {
+  sendAgentTaskRequest,
+  adaptAgentTaskStream,
   sendChatRequest,
   getModels,
   mapModel,

@@ -571,11 +571,13 @@ async function* streamGenerator(fetchResponse, model) {
     return `data: ${JSON.stringify(makeChunk({ reasoning_content: text }))}\n\n`;
   };
 
-  const emitToolCall = (block) => {
+  // 注意：必须逐条 yield，不能把多条 data: 行拼进同一个 yield 字符串——
+  // 下游 writeResponsesStream 按单条 data: 行解析，拼接会被整体丢弃
+  const emitToolCall = function* (block) {
     outputtingToolCalls = true;
     hasToolUse = true;
     const toolId = `call_${uuidv4().replace(/-/g, '').substring(0, 24)}`;
-    let out = `data: ${JSON.stringify(makeChunk({
+    yield `data: ${JSON.stringify(makeChunk({
       tool_calls: [{
         index: toolIndex,
         id: toolId,
@@ -585,7 +587,7 @@ async function* streamGenerator(fetchResponse, model) {
     }))}\n\n`;
     const argsStr = JSON.stringify(block.input);
     for (let i = 0; i < argsStr.length; i += 200) {
-      out += `data: ${JSON.stringify(makeChunk({
+      yield `data: ${JSON.stringify(makeChunk({
         tool_calls: [{
           index: toolIndex,
           function: { arguments: argsStr.substring(i, i + 200) },
@@ -593,7 +595,6 @@ async function* streamGenerator(fetchResponse, model) {
       }))}\n\n`;
     }
     toolIndex++;
-    return out;
   };
 
   while (true) {
@@ -658,7 +659,7 @@ async function* streamGenerator(fetchResponse, model) {
                   const out = emitContent(block.text);
                   if (out) yield out;
                 } else if (block.type === 'tool_use') {
-                  yield emitToolCall(block);
+                  yield* emitToolCall(block);
                 }
               }
             }
@@ -693,7 +694,7 @@ async function* streamGenerator(fetchResponse, model) {
               const out = emitContent(block.text);
               if (out) yield out;
             } else if (block.type === 'tool_use') {
-              yield emitToolCall(block);
+              yield* emitToolCall(block);
             }
           }
 
@@ -732,7 +733,7 @@ async function* streamGenerator(fetchResponse, model) {
       const out = emitContent(block.text);
       if (out) yield out;
     } else if (block.type === 'tool_use') {
-      yield emitToolCall(block);
+      yield* emitToolCall(block);
     }
   }
   yield `data: ${JSON.stringify(makeChunk({}, hasToolUse ? 'tool_calls' : 'stop'))}\n\n`;

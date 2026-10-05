@@ -667,7 +667,9 @@ async function writeResponsesStream(chatStream, model, res, reqId = '-', started
     if (chunkCount === 1) {
       log(`first upstream chunk received${startedAt ? ` (+${Date.now() - startedAt}ms)` : ''}`);
     }
-    const line = chunkLine.trim();
+    // chunkLine 可能包含多条 SSE 行（历史格式遗留），逐行解析
+    for (const rawLine of String(chunkLine).split('\n')) {
+    const line = rawLine.trim();
     const m = line.match(/^data: (.+)$/);
     if (!m) continue;
     const payload = safeJSON(m[1]);
@@ -704,6 +706,7 @@ async function writeResponsesStream(chatStream, model, res, reqId = '-', started
           });
         }
       }
+    }
     }
   }
 
