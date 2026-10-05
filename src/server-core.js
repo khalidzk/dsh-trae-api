@@ -253,6 +253,42 @@ function normalizeMessages(list) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// SSE 心跳：上游 prefill 大上下文（100k+ tokens）时可能数十秒~分钟级无输出，
+// 客户端（codex/CodexPlus 等）空闲超时会断连，表现为"卡死"。
+// 在等待上游数据期间定期向客户端发送 SSE 注释心跳保持连接活跃。
+// ---------------------------------------------------------------------------
+
+const KEEPALIVE_INTERVAL_MS = 15000;
+
+// 把普通异步迭代包装为带超时心跳的迭代：yield { __keepalive: true } 表示超时。
+// 关键：超时后 pending 的 next() promise 必须保留到下一轮继续 race——
+// 重新调用 it.next() 会排队堆积并丢弃已 resolve 的真实数据。
+async function* iterateWithKeepalive(stream, intervalMs = KEEPALIVE_INTERVAL_MS) {
+  const it = stream[Symbol.asyncIterator]();
+  let pending = null;
+  while (true) {
+    if (!pending) pending = it.next();
+    let timer = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ __keepalive: true }), intervalMs);
+    });
+    let result;
+    try {
+      result = await Promise.race([pending, timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (result && result.__keepalive) {
+      yield { __keepalive: true };
+      continue;
+    }
+    pending = null;
+    if (result.done) return;
+    yield result.value;
+  }
+}
+
 // SOLO 原生协议的消息转换：保持 OpenAI 结构透传（tool_calls / tool role /
 // tool_call_id 原样保留，由 trae-client 映射为上游的 function_call 格式）。
 // tools 不再注入 system prompt，而是原生传给上游。
@@ -622,6 +658,11 @@ async function writeResponsesStream(chatStream, model, res, reqId = '-', started
   };
 
   for await (const chunkLine of chatStream) {
+    // 心跳：SSE 注释行，客户端忽略，仅保持连接活跃
+    if (chunkLine && chunkLine.__keepalive) {
+      res.write(': keepalive\n\n');
+      continue;
+    }
     chunkCount++;
     if (chunkCount === 1) {
       log(`first upstream chunk received${startedAt ? ` (+${Date.now() - startedAt}ms)` : ''}`);
@@ -875,6 +916,8 @@ function startServer(options = {}) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        // 立即发送响应头（SSE 注释），避免客户端在 prefill 期间等响应头超时
+        res.write(': connected\n\n');
         const sseStream = await handleOpenAIResponse(fetchResp, usedModel, true);
         let chunkCount = 0;
         let firstChunkAt = 0;
@@ -884,7 +927,12 @@ function startServer(options = {}) {
         let reasoningChars = 0;
         let toolCallCount = 0;
         const seenToolIdx = new Set();
-        for await (const chunk of sseStream) {
+        for await (const chunk of iterateWithKeepalive(sseStream)) {
+          // 心跳：SSE 注释行，客户端忽略，仅保持连接活跃
+          if (chunk && chunk.__keepalive) {
+            res.write(': keepalive\n\n');
+            continue;
+          }
           chunkCount++;
           if (chunkCount === 1) {
             firstChunkAt = Date.now();
@@ -982,8 +1030,16 @@ function startServer(options = {}) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+        res.write(': connected\n\n');
         const sseStream = await handleAnthropicResponse(fetchResp, usedModel, true, inputTokens);
-        for await (const chunk of sseStream) { res.write(chunk); }
+        for await (const chunk of iterateWithKeepalive(sseStream)) {
+          if (chunk && chunk.__keepalive) {
+            // Anthropic wire 心跳：标准 ping 事件
+            res.write(`event: ping\ndata: ${JSON.stringify({ type: 'ping' })}\n\n`);
+            continue;
+          }
+          res.write(chunk);
+        }
         res.end();
       } else {
         const result = await handleAnthropicResponse(fetchResp, usedModel, false, inputTokens);
@@ -1048,7 +1104,8 @@ function startServer(options = {}) {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         const chatStream = await handleOpenAIResponse(fetchResp, usedModel, true);
-        await writeResponsesStream(chatStream, usedModel, res, reqId, startedAt);
+        const keepaliveStream = iterateWithKeepalive(chatStream);
+        await writeResponsesStream(keepaliveStream, usedModel, res, reqId, startedAt);
         res.end();
         console.log(`[responses:${reqId}] <<< stream done +${Date.now() - startedAt}ms${clientClosed ? ' (client had disconnected)' : ''}`);
       } else {

@@ -200,7 +200,9 @@ function getMessageContent(msg) {
 
 function truncateMessages(messages, maxTokens) {
   if (!maxTokens) {
-    maxTokens = parseInt(process.env.MAX_CONTEXT_TOKENS || '200000', 10);
+    // 默认 128k：塞满 200k 会导致上游 prefill 极慢（分钟级无输出），
+    // 客户端空闲超时表现为"卡死"。128k 兼顾上下文长度与首 token 延迟。
+    maxTokens = parseInt(process.env.MAX_CONTEXT_TOKENS || '128000', 10);
   }
   if (messages.length === 0) return messages;
 
@@ -351,25 +353,45 @@ function buildChatBody(messages, model, stream, options, fn) {
 }
 
 // 探测流首事件：4001/4011 表示函数不服务该模型，需换函数重试。
-// 返回 null 表示可继续（正常流），否则返回错误码。
+// 首块等待最多 PEEK_TIMEOUT_MS——大上下文 prefill 可能分钟级无首块，
+// 不能无限阻塞（否则客户端连响应头都收不到就超时了）。超时放行正常流。
+const PEEK_TIMEOUT_MS = 10000;
+
 async function peekStreamError(resp) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
   let firstChunk = null;
-  // 只读第一块数据，足够看到首个 error 事件
-  const { value } = await reader.read();
-  firstChunk = value;
-  buffer = decoder.decode(value || new Uint8Array(), { stream: true });
-  const m = buffer.match(/event:error\ndata:\{"code":(\d+)/) || buffer.match(/"code":(\d+)[^}]*"message"/);
-  if (m) {
-    const code = parseInt(m[1], 10);
-    if (code === 4001 || code === 4011) {
-      await reader.cancel().catch(() => {});
-      return { code };
+  let buffer = '';
+  let timedOut = false;
+
+  try {
+    let timer = null;
+    const result = await Promise.race([
+      reader.read(),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ __timeout: true }), PEEK_TIMEOUT_MS); }),
+    ]);
+    clearTimeout(timer);
+    if (result && result.__timeout) {
+      timedOut = true;
+    } else {
+      firstChunk = result.value;
+      buffer = decoder.decode(result.value || new Uint8Array(), { stream: true });
+    }
+  } catch {
+    // 读失败按放行处理，后续读取会暴露真正的错误
+  }
+
+  if (!timedOut) {
+    const m = buffer.match(/event:error\ndata:\{"code":(\d+)/) || buffer.match(/"code":(\d+)[^}]*"message"/);
+    if (m) {
+      const code = parseInt(m[1], 10);
+      if (code === 4001 || code === 4011) {
+        await reader.cancel().catch(() => {});
+        return { code };
+      }
     }
   }
-  // 正常流：把首块数据拼回一个可完整读取的 Response
+  // 正常流（或超时放行）：把首块数据拼回一个可完整读取的 Response
   const replay = new ReadableStream({
     start(controller) {
       if (firstChunk) controller.enqueue(firstChunk);
